@@ -1,0 +1,60 @@
+# 首次部署前，必須手動到儲存庫 Settings → Pages → Source 選擇「GitHub Actions」，
+# 否則 actions/configure-pages 會因 Pages 尚未啟用而回傳 404。
+name: 部署 Rust API 文件
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 建置並部署 API 文件
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 快取 Rust 建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      - name: 建置 Rust API 文件
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: 建立文件首頁重導向
+        shell: bash
+        run: |
+          printf '%s\n' '<!doctype html><meta http-equiv="refresh" content="0; url=pcan_kit/index.html">' > target/doc/index.html
+
+      - name: 設定 GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: 上傳 Pages 成品
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc
+
+      - name: 部署 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

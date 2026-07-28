@@ -1,0 +1,24 @@
+# 漏洞是時間的函數，不是 commit 的函數：即使程式碼完全沒變，
+# RUSTSEC 資料庫仍可能新增條目，因此 advisories 必須定期排程檢查。
+# 相對地，feature 非加性只會在 feature 宣告或 cfg gate 改動時出問題，
+# 所以 cargo-hack 採變更觸發即可，不需要排程重複執行。
+name: 每週供應鏈漏洞稽核
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  advisories:
+    name: 檢查 RUSTSEC 安全公告
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 檢查已知漏洞
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

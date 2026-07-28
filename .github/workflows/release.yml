@@ -1,0 +1,114 @@
+name: 建立發行版本
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: 建置發行檔（${{ matrix.target }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 快取 Rust 建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+          save-if: ${{ github.ref_type == 'tag' }}
+
+      - name: 建置四個範例程式
+        run: cargo build --release --locked -p pcan-kit --examples --target ${{ matrix.target }}
+
+      - name: 打包 Linux 發行檔
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          package="pcan-kit-${{ github.ref_name }}-${{ matrix.target }}"
+          mkdir -p "dist/$package"
+          for example in monitor echo cyclic uds_request; do
+            install -m 755 "target/${{ matrix.target }}/release/examples/$example" "dist/$package/$example"
+          done
+          install -m 644 README.md LICENSE-MIT LICENSE-APACHE "dist/$package/"
+          tar -C dist -czf "dist/$package.tar.gz" "$package"
+
+      - name: 打包 Windows 發行檔
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $package = "pcan-kit-${{ github.ref_name }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$package" | Out-Null
+          foreach ($example in @("monitor", "echo", "cyclic", "uds_request")) {
+            Copy-Item "target/${{ matrix.target }}/release/examples/$example.exe" "dist/$package/$example.exe"
+          }
+          Copy-Item README.md, LICENSE-MIT, LICENSE-APACHE "dist/$package/"
+          Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip" -CompressionLevel Optimal
+
+      - name: 上傳平台發行檔
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: 發布 GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 下載所有平台發行檔
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+
+      - name: 產生 SHA-256 校驗碼
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd release
+          sha256sum pcan-kit-*.tar.gz pcan-kit-*.zip > SHA256SUMS
+
+      - name: 建立發行版本
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/pcan-kit-*.tar.gz
+            release/pcan-kit-*.zip
+            release/SHA256SUMS
+          generate_release_notes: true
+          body: |
+            ## 執行需求
+
+            這些執行檔採**執行期動態載入** PCAN-Basic 函式庫，因此**編譯時不需要 PEAK SDK**。
+
+            在**沒有安裝 PEAK 驅動**的機器上執行，程式會回報 `LoadError::NotFound` 並列出嘗試過的路徑後正常結束——**這是預期行為，不是程式壞掉**。
+
+            - Windows：安裝 PEAK 的 PCAN 驅動，或設定環境變數 `PCAN_BASIC_LIB` 指向 `PCANBasic.dll`
+            - Linux（PCAN-Basic）：安裝 PEAK 的 `libpcanbasic.so`
+            - Linux（SocketCAN）：不需要 PEAK 函式庫，用 `sudo ip link set can0 up type can bitrate 500000` 設定介面即可

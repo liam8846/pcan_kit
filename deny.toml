@@ -1,0 +1,53 @@
+# cargo-deny 供應鏈稽核設定。
+# 本專案刻意把相依壓到最低（Cargo.lock 只有 38 個 package），
+# 因此採嚴格設定：任何新增的間接相依都應該被人看見一次。
+
+[graph]
+# 明確列出實際支援的目標。不列的話 cargo-deny 會把所有 target 的相依都算進來
+# （例如 wasm 的 wasi），產生我們根本不會編譯的授權與版本告警。
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = [
+    "MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
+    "ISC",          # libloading
+    "Unicode-3.0",  # unicode-ident 的 AND 條款
+    "Unlicense",    # memchr 的 "Unlicense OR MIT" 其中一支
+    "BSD-2-Clause", "BSD-3-Clause", "Zlib",
+]
+confidence-threshold = 0.93
+exceptions = []
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+highlight = "all"
+skip = [
+    # tokio-macros 與 tracing-attributes 仍在 syn 2；serde_derive 與
+    # thiserror-impl 已升到 syn 3。兩者都只是 proc-macro 的建置期相依，
+    # 不進入最終二進位，且我們無法單方面統一。等上游收斂後移除這條。
+    { crate = "syn@2", reason = "tokio-macros / tracing-attributes 尚未升級到 syn 3" },
+]
+deny = [
+    # 明確拒絕本專案刻意不用的東西，避免它們透過某次相依更新悄悄溜進來。
+    { crate = "socketcan",   reason = "刻意直接使用 libc，理由見 pcan-socketcan crate 文件" },
+    { crate = "async-trait", reason = "Transport 使用 RPITIT，不得引入 Box<dyn Future>" },
+    { crate = "futures",     reason = "只用 tokio 與 core::future，不引入 futures 全家桶" },
+    { crate = "openssl-sys", reason = "工控產品不接受 C OpenSSL 建置相依" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

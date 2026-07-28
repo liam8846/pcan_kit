@@ -1,5 +1,9 @@
 # pcan_kit
 
+[![CI](https://img.shields.io/github/actions/workflow/status/liam8846/pcan_kit/ci.yml?branch=master&label=CI)](https://github.com/liam8846/pcan_kit/actions/workflows/ci.yml)
+[![授權](https://img.shields.io/github/license/liam8846/pcan_kit?label=%E6%8E%88%E6%AC%8A)](LICENSE-MIT)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-orange?logo=rust)](Cargo.toml)
+
 `pcan_kit` 是以 Rust 2024 編寫的產品級 CAN 通訊函式庫。它同時支援
 Windows／Linux 的 PEAK PCAN-Basic 與 Linux SocketCAN，並提供 CAN FD、
 自動重連、推送式訂閱、bounded 傳送佇列、週期傳送與請求—回應交易。

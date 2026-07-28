@@ -1,0 +1,260 @@
+name: 持續整合
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: 格式檢查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 安裝 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: 快取 Rust 建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "${{ github.ref == 'refs/heads/master' }}"
+      - name: 檢查格式
+        run: cargo --locked fmt --all -- --check
+
+  lint:
+    name: 靜態分析（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 安裝 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: 快取 Rust 建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "${{ github.ref == 'refs/heads/master' }}"
+      - name: 檢查所有功能與目標
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - name: 檢查停用預設功能
+        run: cargo clippy --workspace --no-default-features --locked -- -D warnings
+
+  test:
+    name: 建置與測試（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 安裝 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+      - name: 快取 Rust 建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "${{ github.ref == 'refs/heads/master' }}"
+      - name: 建置所有功能
+        run: cargo build --workspace --all-features --locked
+      - name: 建置所有範例
+        run: cargo build --workspace --all-features --examples --locked
+      - name: 執行所有測試
+        run: cargo test --workspace --all-features --locked
+      - name: 建置停用預設功能
+        run: cargo build --workspace --no-default-features --locked
+
+  docs:
+    name: 文件建置
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 安裝 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+      - name: 快取 Rust 建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: "${{ github.ref == 'refs/heads/master' }}"
+      - name: 建置 API 文件
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  msrv:
+    name: 最低支援 Rust 版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 讀取宣告的最低支援版本
+        id: msrv
+        shell: bash
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "宣告的 MSRV：$version"
+      - name: 安裝最低支援 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "${{ steps.msrv.outputs.version }}"
+      - name: 快取最低支援版本建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+          save-if: "${{ github.ref == 'refs/heads/master' }}"
+      - name: 以最低支援版本檢查
+        run: cargo check --workspace --all-features --locked
+
+  vcan:
+    name: 虛擬 CAN 整合測試（觀察中）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 安裝 Rust 工具鏈
+        uses: dtolnay/rust-toolchain@stable
+      - name: 快取虛擬 CAN 建置資料
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: vcan
+          save-if: "${{ github.ref == 'refs/heads/master' }}"
+      - name: 準備虛擬 CAN 介面
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! sudo modprobe vcan 2>/dev/null; then
+            echo "vcan 模組不在已載入的模組樹中，嘗試安裝 linux-modules-extra"
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe vcan
+          fi
+          for name in vcan0 vcan9; do
+            sudo ip link add dev "$name" type vcan
+            sudo ip link set "$name" mtu 72
+            sudo ip link set up "$name"
+          done
+          ip -details link show vcan0
+      - name: SocketCAN 傳輸層虛擬 CAN 測試
+        env:
+          PCAN_VCAN: vcan0
+          PCAN_VCAN_REQUIRED: "1"
+        run: cargo test -p pcan-socketcan --features vcan-tests --test vcan --locked -- --test-threads=1 --nocapture
+      - name: Link 端到端虛擬 CAN 測試
+        env:
+          PCAN_VCAN: vcan0
+          PCAN_VCAN_REQUIRED: "1"
+        run: cargo test -p pcan-kit --features vcan-tests --test vcan_link --locked -- --test-threads=1 --nocapture
+      - name: 破壞性虛擬 CAN 測試
+        env:
+          PCAN_VCAN_ADMIN: vcan9
+          PCAN_VCAN_REQUIRED: "1"
+        run: cargo test -p pcan-socketcan --features vcan-tests --test vcan_admin --locked -- --test-threads=1 --nocapture
+
+  hack:
+    name: 功能組合冪集
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: 取出完整版本歷史
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 判斷是否需要執行
+        id: gate
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; echo "手動觸發"; exit 0
+          fi
+          # 推送事件用 github.event.before；拉取請求事件沒有該欄位，
+          # 必須改用 base 分支的提交，否則會永遠落入下方的保守分支而失去條件執行的意義。
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            before="${{ github.event.pull_request.base.sha }}"
+          else
+            before="${{ github.event.before }}"
+          fi
+          # 強制推送或首次推送時，前一個提交可能是全零或無效；判斷不出來就執行。
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$before^{commit}" 2>/dev/null; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; echo "無法判斷變更範圍，保守執行"; exit 0
+          fi
+          if git diff --name-only "$before" "${{ github.sha }}" | grep -q 'Cargo\.toml'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"; echo "偵測到 Cargo.toml 變更"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"; echo "本次沒有 Cargo.toml 變更，略過"
+          fi
+      - name: 安裝 Rust 工具鏈
+        if: steps.gate.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@stable
+      - name: 安裝功能組合檢查工具
+        if: steps.gate.outputs.run == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
+      - name: 快取功能組合建置資料
+        if: steps.gate.outputs.run == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: hack
+          save-if: "${{ github.ref == 'refs/heads/master' }}"
+      - name: 檢查所有功能組合
+        if: steps.gate.outputs.run == 'true'
+        run: >-
+          cargo hack --workspace --feature-powerset --exclude-features vcan-tests
+          --keep-going check --locked
+
+  deny:
+    name: 供應鏈稽核
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 執行供應鏈稽核
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  docs-lang:
+    name: 繁體中文文件檢查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+      - name: 檢查 Rust 文件語言
+        run: python3 .github/scripts/check_cjk_docs.py
+
+  ci-ok:
+    name: CI 全數通過
+    if: always()
+    needs: [fmt, lint, test, docs, msrv, vcan, hack, deny, docs-lang]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 檢查所有前置工作
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "有工作未通過：${{ join(needs.*.result, ', ') }}"
+          exit 1
