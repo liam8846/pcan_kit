@@ -1,3 +1,7 @@
+#![cfg_attr(
+    not(all(target_os = "linux", feature = "vcan-tests")),
+    allow(missing_docs)
+)]
 #![cfg(all(target_os = "linux", feature = "vcan-tests"))]
 //! Linux vcan 執行期整合測試。
 //!

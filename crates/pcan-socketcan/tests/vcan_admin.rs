@@ -1,3 +1,7 @@
+#![cfg_attr(
+    not(all(target_os = "linux", feature = "vcan-tests")),
+    allow(missing_docs)
+)]
 #![cfg(all(target_os = "linux", feature = "vcan-tests"))]
 //! 需要管理員權限的 vcan 整合測試。
 //!
