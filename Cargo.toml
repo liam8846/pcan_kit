@@ -15,6 +15,7 @@ pcan-basic-sys = { path = "crates/pcan-basic-sys", version = "0.1.0" }
 pcan-basic = { path = "crates/pcan-basic", version = "0.1.0" }
 pcan-socketcan = { path = "crates/pcan-socketcan", version = "0.1.0" }
 pcan-link = { path = "crates/pcan-link", version = "0.1.0" }
+pcan-kit = { path = "crates/pcan-kit", version = "0.1.0" }
 
 thiserror = "2.0"
 bitflags = "2.13"

@@ -1,0 +1,27 @@
+[package]
+name = "pcan-basic"
+description = "PCAN-Basic 的 Windows 與 Linux 非同步傳輸後端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["tracing"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+pcan-core = { workspace = true }
+pcan-basic-sys = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
+tracing = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

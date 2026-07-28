@@ -1,0 +1,15 @@
+[package]
+name = "pcan-basic-sys"
+description = "PCAN-Basic 的執行期 FFI 綁定與狀態分類"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+libloading = { workspace = true }
+pcan-core = { workspace = true }

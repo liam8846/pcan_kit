@@ -18,7 +18,11 @@ pub struct Capabilities {
     pub brs: bool,
     /// 是否能接收本地送出幀的回音。
     pub echo_frames: bool,
-    /// 是否能在硬體或核心層套用過濾器。
+    /// 後端是否具備在硬體或作業系統核心層套用過濾器的能力。
+    ///
+    /// 此欄位只描述後端具備此能力，不保證每個 [`FilterSet`] 都會實際下推。
+    /// 個別規則集是否下推取決於後端能否精確表示；無法下推時會退回軟體
+    /// 過濾，並以 debug 等級記錄。
     pub hardware_filter: bool,
     /// 是否提供硬體時間戳。
     pub hardware_timestamps: bool,

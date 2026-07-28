@@ -261,6 +261,19 @@ impl Frame {
         self.flags.contains(FrameFlags::BRS)
     }
 
+    /// 設定接收方向的 CAN FD error-state indicator。
+    ///
+    /// # Errors
+    ///
+    /// 對古典 CAN 或 RTR 幀啟用 ESI 時回傳 [`ConfigError::InvalidFlags`]。
+    pub fn with_esi(mut self, enabled: bool) -> Result<Self, ConfigError> {
+        if enabled && !self.is_fd() {
+            return Err(ConfigError::InvalidFlags("ESI 僅能搭配 CAN FD"));
+        }
+        self.flags.set(FrameFlags::ESI, enabled);
+        Ok(self)
+    }
+
     /// 取得由有效資料長度反查的 DLC。
     #[must_use]
     pub const fn dlc(&self) -> u8 {

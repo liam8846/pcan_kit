@@ -54,6 +54,15 @@ impl FilterRule {
         if self.invert { !base } else { base }
     }
 
+    /// 取得規則的原始識別碼、遮罩與反轉旗標。
+    ///
+    /// 後端可用此資訊判斷規則能否精確下推到硬體；回傳值仍限制在
+    /// CAN 識別碼與擴充格式旗標的有效位元。
+    #[must_use]
+    pub const fn parts(&self) -> (u32, u32, bool) {
+        (self.id, self.mask, self.invert)
+    }
+
     const fn base_matches(&self, id: CanId) -> bool {
         ((id.to_bits() ^ self.id) & self.mask) == 0
     }
