@@ -2,22 +2,25 @@
 
 /// 退避策略與抖動器。
 pub mod backoff;
+/// 背景工作任務的異常結束收斂守衛。
+pub(crate) mod guard;
 /// 純連線狀態機。
 pub mod machine;
 
 use core::future::pending;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pcan_core::{
-    BusState, BusStatus, Capabilities, Error, FaultKind, FilterSet, Stats, Transport,
+    BusState, BusStatus, BusWarnings, Capabilities, Error, FaultKind, FilterSet, Stats, Transport,
     TransportEvent, TransportFactory,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use self::backoff::{BackoffPolicy, SplitMixJitter};
+use self::guard::{Severity, ShutdownGuard};
 use self::machine::{LinkAction, LinkInput, LinkMachine, LinkState};
 use crate::cyclic::{CyclicCommand, run_scheduler};
 use crate::events::{BusEvent, FaultCause};
@@ -38,6 +41,7 @@ pub(crate) enum SupervisorCommand {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RuntimeConfig {
     pub(crate) tx_capacity: usize,
+    pub(crate) tx_high_water_ratio: Option<f32>,
     pub(crate) pending_policy: PendingTxPolicy,
     pub(crate) max_pending_age: Duration,
     pub(crate) tx_retry_limit: u32,
@@ -70,6 +74,8 @@ pub(crate) struct SharedRuntime {
     pub(crate) bus_status: Arc<Mutex<BusStatus>>,
     pub(crate) capabilities: Arc<Mutex<Option<Capabilities>>>,
     pub(crate) in_flight: Arc<AtomicUsize>,
+    pub(crate) tx_staged: Arc<AtomicUsize>,
+    pub(crate) tx_high_water: Arc<AtomicBool>,
     pub(crate) raw: Arc<std::sync::OnceLock<broadcast::Sender<pcan_core::RxFrame>>>,
 }
 
@@ -178,6 +184,21 @@ async fn apply_input<F: TransportFactory>(
     }
 }
 
+/// 依警告位元的上升緣累加接收溢位計數。
+///
+/// PCAN 的狀態查詢會反覆回報尚未清除的位元，因此只有由未設定轉為設定時
+/// 才累加，避免把持續中的同一次溢位嚴重高估。
+fn record_overruns(stats: &Stats, previous: BusWarnings, current: BusWarnings) {
+    if current.contains(BusWarnings::RX_OVERRUN) && !previous.contains(BusWarnings::RX_OVERRUN) {
+        stats.inc_rx_hw_overrun();
+    }
+    if current.contains(BusWarnings::QUEUE_OVERRUN)
+        && !previous.contains(BusWarnings::QUEUE_OVERRUN)
+    {
+        stats.inc_rx_queue_overrun();
+    }
+}
+
 /// 建立並啟動所有背景任務。
 #[allow(clippy::too_many_lines)]
 pub(crate) fn spawn<F: TransportFactory>(
@@ -195,6 +216,7 @@ pub(crate) fn spawn<F: TransportFactory>(
     let (tx_tx, tx_rx) = mpsc::channel(config.tx_capacity);
     let (transport_tx, transport_rx) = watch::channel(None);
 
+    let tx_shutdown = ShutdownGuard::new(&shared, cyclic_tx.clone(), "tx", Severity::Fatal);
     tokio::spawn(run_tx(
         tx_rx,
         transport_rx,
@@ -202,19 +224,29 @@ pub(crate) fn spawn<F: TransportFactory>(
         supervisor_tx.clone(),
         shared.events.clone(),
         Arc::clone(&shared.stats),
+        Arc::clone(&shared.tx_staged),
+        Arc::clone(&shared.tx_high_water),
         config,
+        tx_shutdown,
     ));
+    let scheduler_shutdown =
+        ShutdownGuard::new(&shared, cyclic_tx.clone(), "cyclic", Severity::Degraded);
     tokio::spawn(run_scheduler(
         cyclic_rx,
         cyclic_tx.clone(),
         tx_tx.clone(),
         shared.events.clone(),
         shared.state.subscribe(),
+        Arc::clone(&shared.stats),
+        scheduler_shutdown,
     ));
 
     let supervisor_sender = supervisor_tx.clone();
     let supervisor_cyclic = cyclic_tx.clone();
+    let supervisor_shutdown =
+        ShutdownGuard::new(&shared, cyclic_tx.clone(), "supervisor", Severity::Fatal);
     tokio::spawn(async move {
+        let mut shutdown = supervisor_shutdown;
         let jitter = jitter_seed.map_or_else(SplitMixJitter::from_entropy, SplitMixJitter::new);
         let mut machine = LinkMachine::with_jitter(policy, jitter);
         let mut saved_filter = initial_filter;
@@ -225,6 +257,7 @@ pub(crate) fn spawn<F: TransportFactory>(
         let mut health_deadline = None;
         let mut stable_deadline = None;
         let started_at = Instant::now();
+        let mut shutdown_state = shared.state.subscribe();
 
         {
             let mut context = ActionContext {
@@ -246,9 +279,11 @@ pub(crate) fn spawn<F: TransportFactory>(
             router.close_all();
             transactions.disconnect_all();
             let _ignored = supervisor_cyclic.send(CyclicCommand::Close);
+            shutdown.disarm();
             return;
         }
         let mut last_rx = Instant::now();
+        let mut last_warnings = BusWarnings::empty();
 
         loop {
             let backoff_at =
@@ -290,6 +325,9 @@ pub(crate) fn spawn<F: TransportFactory>(
                             shared.in_flight.store(transactions.len(), Ordering::Release);
                         }
                         Ok(TransportEvent::Status(status)) => {
+                            shared.stats.inc_rx_error_frames();
+                            record_overruns(&shared.stats, last_warnings, status.warnings);
+                            last_warnings = status.warnings;
                             *lock(&shared.bus_status) = status;
                             let _receivers = shared.events.send(BusEvent::BusStateChanged(status));
                             if !status.warnings.is_empty() {
@@ -320,6 +358,8 @@ pub(crate) fn spawn<F: TransportFactory>(
                         if let Ok(Ok(status)) =
                             tokio::time::timeout(interval, active.status()).await
                         {
+                            record_overruns(&shared.stats, last_warnings, status.warnings);
+                            last_warnings = status.warnings;
                             *lock(&shared.bus_status) = status;
                             let _receivers =
                                 shared.events.send(BusEvent::BusStateChanged(status));
@@ -377,18 +417,40 @@ pub(crate) fn spawn<F: TransportFactory>(
                             };
                             let _ignored = reply.send(result);
                         }
-                        None => break,
+                        None => {
+                            input = Some(LinkInput::Close);
+                            cause = FaultCause::UserRequested;
+                        }
                     }
                 }
                 command = router_rx.recv() => {
                     if let Some(command) = command {
                         router.handle(command);
+                    } else {
+                        // 最後一個 Link 與所有訂閱控制端皆已釋放。
+                        input = Some(LinkInput::Close);
+                        cause = FaultCause::UserRequested;
                     }
                 }
                 command = transaction_rx.recv() => {
                     if let Some(command) = command {
                         transactions.handle(command);
                         shared.in_flight.store(transactions.len(), Ordering::Release);
+                    } else {
+                        // 最後一個 Link 與所有交易控制端皆已釋放。
+                        input = Some(LinkInput::Close);
+                        cause = FaultCause::UserRequested;
+                    }
+                }
+                changed = shutdown_state.changed() => {
+                    if changed.is_err()
+                        || *shutdown_state.borrow_and_update() == LinkState::Closed
+                            && machine.state() != LinkState::Closed
+                    {
+                        // Fatal 工作者守衛把狀態推到 Closed 後，由 supervisor
+                        // 完成需要 await 的 transport 關閉流程。
+                        input = Some(LinkInput::Close);
+                        cause = FaultCause::UserRequested;
                     }
                 }
             }
@@ -434,6 +496,7 @@ pub(crate) fn spawn<F: TransportFactory>(
                 }
             }
         }
+        shutdown.disarm();
     });
 
     RuntimeChannels {

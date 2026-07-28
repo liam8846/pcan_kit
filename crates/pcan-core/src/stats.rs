@@ -7,13 +7,13 @@ pub struct Stats {
     pub rx_frames: AtomicU64,
     /// 已成功傳送的資料幀數。
     pub tx_frames: AtomicU64,
-    /// 已接收的錯誤幀數。
+    /// 透過 RX 串流收到的錯誤或狀態幀數。
     pub rx_error_frames: AtomicU64,
     /// 控制器接收溢位次數。
     pub rx_hw_overrun: AtomicU64,
     /// 驅動或函式庫接收佇列溢位次數。
     pub rx_queue_overrun: AtomicU64,
-    /// 傳送佇列滿事件次數。
+    /// 因傳送佇列已滿而被拒絕的排入次數。
     pub tx_queue_full: AtomicU64,
     /// 因政策或佇列壓力丟棄的傳送幀數。
     pub tx_dropped: AtomicU64,
@@ -32,13 +32,13 @@ pub struct StatsSnapshot {
     pub rx_frames: u64,
     /// 已成功傳送的資料幀數。
     pub tx_frames: u64,
-    /// 已接收的錯誤幀數。
+    /// 透過 RX 串流收到的錯誤或狀態幀數。
     pub rx_error_frames: u64,
     /// 控制器接收溢位次數。
     pub rx_hw_overrun: u64,
     /// 驅動或函式庫接收佇列溢位次數。
     pub rx_queue_overrun: u64,
-    /// 傳送佇列滿事件次數。
+    /// 因傳送佇列已滿而被拒絕的排入次數。
     pub tx_queue_full: u64,
     /// 因政策或佇列壓力丟棄的傳送幀數。
     pub tx_dropped: u64,
@@ -77,7 +77,7 @@ impl Stats {
         self.tx_frames.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 將接收錯誤幀數遞增一。
+    /// 將透過 RX 串流收到的錯誤或狀態幀數遞增一。
     pub fn inc_rx_error_frames(&self) {
         self.rx_error_frames.fetch_add(1, Ordering::Relaxed);
     }
@@ -92,7 +92,7 @@ impl Stats {
         self.rx_queue_overrun.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 將傳送佇列滿事件次數遞增一。
+    /// 將因傳送佇列已滿而被拒絕的排入次數遞增一。
     pub fn inc_tx_queue_full(&self) {
         self.tx_queue_full.fetch_add(1, Ordering::Relaxed);
     }

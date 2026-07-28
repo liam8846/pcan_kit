@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -17,7 +17,7 @@ use crate::supervisor::{RuntimeChannels, SupervisorCommand};
 use crate::transaction::{
     CollectMode, PendingResponse, ResponseSpec, TransactionCommand, TransactionError,
 };
-use crate::txqueue::{PendingTxPolicy, TxItem};
+use crate::txqueue::{PendingTxPolicy, TxItem, TxQueueDepth};
 
 fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
     match value.lock() {
@@ -34,9 +34,12 @@ pub(crate) struct LinkInner {
     pub(crate) bus_status: Arc<Mutex<BusStatus>>,
     pub(crate) capabilities: Arc<Mutex<Option<Capabilities>>>,
     pub(crate) in_flight: Arc<AtomicUsize>,
+    pub(crate) tx_staged: Arc<AtomicUsize>,
+    pub(crate) tx_high_water: Arc<AtomicBool>,
     pub(crate) raw: Arc<OnceLock<broadcast::Sender<RxFrame>>>,
     pub(crate) pending_policy: PendingTxPolicy,
     pub(crate) tx_capacity: usize,
+    pub(crate) tx_high_water_ratio: Option<f32>,
     pub(crate) cyclic_next: AtomicU64,
 }
 
@@ -54,13 +57,36 @@ impl core::fmt::Debug for LinkInner {
 /// 一條會自動維持可用性的邏輯 CAN 連線。
 ///
 /// `Link` 可安全複製並跨 task 分享。傳輸故障後會以指數退避重建連線，
-/// 工廠在每次 `open()` 套用完整通道設定，監督器再重放保存的過濾器。
+/// 工廠在每次 `open()` 套用完整通道設定，監督器再重放保存的過濾器。最後
+/// 一個 `Link` 複本被丟棄時會自動關閉背景任務；仍建議顯式呼叫
+/// [`close`](Self::close) 以等待關閉完成。
 #[derive(Clone, Debug)]
 pub struct Link {
     pub(crate) inner: Arc<LinkInner>,
 }
 
 impl Link {
+    #[allow(clippy::cast_precision_loss)]
+    fn publish_tx_high_water(&self) {
+        let Some(ratio) = self.inner.tx_high_water_ratio else {
+            return;
+        };
+        let capacity = self.inner.channels.tx.max_capacity();
+        let queued = capacity.saturating_sub(self.inner.channels.tx.capacity());
+        if queued as f32 / capacity as f32 > ratio
+            && self
+                .inner
+                .tx_high_water
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let _receivers = self.inner.events.send(BusEvent::TxQueueHighWater {
+                queued: u32::try_from(queued).unwrap_or(u32::MAX),
+                capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+            });
+        }
+    }
+
     /// 建立連線建構器。
     #[must_use]
     pub fn builder<F: TransportFactory>(factory: F) -> LinkBuilder<F> {
@@ -68,12 +94,12 @@ impl Link {
     }
 
     fn disconnected_if_fail_fast(&self) -> Result<(), Error> {
-        if self.inner.pending_policy == PendingTxPolicy::FailFast
+        if self.state() == LinkState::Closed {
+            Err(Error::Closed)
+        } else if self.inner.pending_policy == PendingTxPolicy::FailFast
             && self.state() != LinkState::Connected
         {
             Err(Error::Disconnected { attempt: 0 })
-        } else if self.state() == LinkState::Closed {
-            Err(Error::Closed)
         } else {
             Ok(())
         }
@@ -97,16 +123,24 @@ impl Link {
     /// 佇列已滿、連線已關閉或 `FailFast` 政策拒絕斷線傳送時回傳錯誤。
     pub fn try_send(&self, frame: Frame) -> Result<(), Error> {
         self.disconnected_if_fail_fast()?;
-        self.inner
+        match self
+            .inner
             .channels
             .tx
             .try_send(TxItem::fire_and_forget(frame))
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::TrySendError::Full(_) => Error::TxQueueFull {
+        {
+            Ok(()) => {
+                self.publish_tx_high_water();
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.inner.stats.inc_tx_queue_full();
+                Err(Error::TxQueueFull {
                     capacity: self.inner.tx_capacity,
-                },
-                tokio::sync::mpsc::error::TrySendError::Closed(_) => Error::Closed,
-            })
+                })
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+        }
     }
 
     /// 在指定期限內等待傳送佇列取得空位。
@@ -116,17 +150,23 @@ impl Link {
     /// 等待逾時、連線已關閉或 `FailFast` 政策拒絕斷線傳送時回傳錯誤。
     pub async fn send_timeout(&self, frame: Frame, timeout: Duration) -> Result<(), Error> {
         self.disconnected_if_fail_fast()?;
-        self.inner
+        match self
+            .inner
             .channels
             .tx
             .send_timeout(TxItem::fire_and_forget(frame), timeout)
             .await
-            .map_err(|error| match error {
-                tokio::sync::mpsc::error::SendTimeoutError::Timeout(_) => {
-                    Error::Timeout { timeout }
-                }
-                tokio::sync::mpsc::error::SendTimeoutError::Closed(_) => Error::Closed,
-            })
+        {
+            Ok(()) => {
+                self.publish_tx_high_water();
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                self.inner.stats.inc_tx_queue_full();
+                Err(Error::Timeout { timeout })
+            }
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => Err(Error::Closed),
+        }
     }
 
     /// 排入幀並等待後端確認實際送出。
@@ -143,6 +183,7 @@ impl Link {
             .send(TxItem::acknowledged(frame, sender))
             .await
             .map_err(|_| Error::Closed)?;
+        self.publish_tx_high_water();
         receiver.await.map_err(|_| Error::Closed)?
     }
 
@@ -232,6 +273,22 @@ impl Link {
     #[must_use]
     pub fn stats(&self) -> StatsSnapshot {
         self.inner.stats.snapshot()
+    }
+
+    /// 取得傳送佇列的即時水位快照。
+    ///
+    /// `channel` 是尚未被傳送工作者取走的第一段，直接決定
+    /// [`try_send`](Self::try_send) 是否會回傳 `TxQueueFull`；`staged` 是工作者
+    /// 已取走、但尚未送上匯流排的第二段。整體延遲應查看兩段合計，主動背壓
+    /// 則應查看 channel 段的使用比例。
+    #[must_use]
+    pub fn tx_queue_depth(&self) -> TxQueueDepth {
+        let capacity = self.inner.channels.tx.max_capacity();
+        TxQueueDepth {
+            channel: capacity.saturating_sub(self.inner.channels.tx.capacity()),
+            staged: self.inner.tx_staged.load(Ordering::Relaxed),
+            capacity,
+        }
     }
 
     /// 取得當前傳輸能力；未連線時為 `None`。

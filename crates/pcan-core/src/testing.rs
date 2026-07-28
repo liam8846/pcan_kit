@@ -34,6 +34,7 @@ struct FakeState {
     fault_after: Option<(usize, FaultKind)>,
     fault_after_fired: bool,
     delivered_events: usize,
+    panic_on_recv: bool,
 }
 
 #[derive(Debug)]
@@ -82,6 +83,7 @@ fn shared_from_builder(builder: FakeTransportBuilder, is_open: bool) -> (Arc<Sha
         fault_after: builder.fault_after,
         fault_after_fired: false,
         delivered_events: 0,
+        panic_on_recv: builder.panic_on_recv,
     };
     (
         Arc::new(Shared {
@@ -113,6 +115,7 @@ pub struct FakeTransportBuilder {
     tx_failure_kind: Option<FaultKind>,
     tx_busy_times: u32,
     capabilities: Capabilities,
+    panic_on_recv: bool,
 }
 
 impl FakeTransportBuilder {
@@ -158,6 +161,13 @@ impl FakeTransportBuilder {
     #[must_use]
     pub fn tx_busy_times(mut self, n: u32) -> Self {
         self.tx_busy_times = n;
+        self
+    }
+
+    /// 讓每次 `recv()` 立即 panic，供背景工作任務收斂測試使用。
+    #[must_use]
+    pub const fn panic_on_recv(mut self) -> Self {
+        self.panic_on_recv = true;
         self
     }
 
@@ -249,6 +259,10 @@ impl Transport for FakeTransport {
                 if !state.is_open {
                     return Err(Error::Closed);
                 }
+                assert!(
+                    !state.panic_on_recv,
+                    "FakeTransport 依測試設定於 recv() panic"
+                );
                 if let Some((after, kind)) = state.fault_after
                     && !state.fault_after_fired
                     && state.delivered_events >= after

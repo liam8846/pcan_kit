@@ -26,6 +26,11 @@ pub enum FaultCause {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum BusEvent {
+    /// 背景工作任務異常結束（panic 或被強制丟棄）。
+    WorkerLost {
+        /// 結束的工作任務名稱，供日誌定位。
+        worker: &'static str,
+    },
     /// 開始開啟傳輸層。
     Connecting,
     /// 已成功連線。
@@ -59,6 +64,20 @@ pub enum BusEvent {
     TxDropped {
         /// 本次丟棄數。
         count: u64,
+    },
+    /// 傳送佇列越過高水位，應用層應主動降速。
+    TxQueueHighWater {
+        /// 目前 channel 段排隊幀數。
+        queued: u32,
+        /// 單段容量。
+        capacity: u32,
+    },
+    /// 傳送佇列已回落至低水位。
+    TxQueueRecovered {
+        /// 目前 channel 段排隊幀數。
+        queued: u32,
+        /// 單段容量。
+        capacity: u32,
     },
     /// 交易逾時後重送。
     TransactionRetried {

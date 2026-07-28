@@ -5,12 +5,13 @@ use core::time::Duration;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
 
-use pcan_core::{Error, Frame};
+use pcan_core::{Error, Frame, Stats};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::LinkState;
 use crate::events::BusEvent;
+use crate::supervisor::guard::ShutdownGuard;
 use crate::txqueue::TxItem;
 
 /// 週期傳送識別碼。
@@ -349,21 +350,30 @@ fn enqueue(
     sender: &mpsc::Sender<TxItem>,
     events: &broadcast::Sender<BusEvent>,
     state: LinkState,
+    global_stats: &Stats,
 ) -> bool {
     if state != LinkState::Connected {
         entry.stats.skipped.fetch_add(1, Ordering::Relaxed);
         return false;
     }
-    if sender
-        .try_send(TxItem::fire_and_forget(entry.config.frame))
-        .is_ok()
-    {
-        entry.stats.sent.fetch_add(1, Ordering::Relaxed);
-        true
-    } else {
-        entry.stats.skipped.fetch_add(1, Ordering::Relaxed);
-        let _receivers = events.send(BusEvent::TxDropped { count: 1 });
-        false
+    match sender.try_send(TxItem::fire_and_forget(entry.config.frame)) {
+        Ok(()) => {
+            entry.stats.sent.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            entry.stats.skipped.fetch_add(1, Ordering::Relaxed);
+            global_stats.inc_tx_queue_full();
+            global_stats.inc_tx_dropped();
+            let _receivers = events.send(BusEvent::TxDropped { count: 1 });
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            entry.stats.skipped.fetch_add(1, Ordering::Relaxed);
+            global_stats.inc_tx_dropped();
+            let _receivers = events.send(BusEvent::TxDropped { count: 1 });
+            false
+        }
     }
 }
 
@@ -375,6 +385,8 @@ pub(crate) async fn run_scheduler(
     tx: mpsc::Sender<TxItem>,
     events: broadcast::Sender<BusEvent>,
     state: watch::Receiver<LinkState>,
+    global_stats: Arc<Stats>,
+    mut shutdown: ShutdownGuard,
 ) {
     let mut entries = Vec::<Entry>::new();
     let mut heap = BinaryHeap::<Reverse<(Instant, u8, CyclicId, u64)>>::new();
@@ -443,7 +455,8 @@ pub(crate) async fn run_scheduler(
                     }
                     CyclicCommand::Trigger(id) => {
                         if let Some(entry) = find_entry(&mut entries, id) {
-                            let _sent = enqueue(entry, &tx, &events, *state.borrow());
+                            let _sent =
+                                enqueue(entry, &tx, &events, *state.borrow(), &global_stats);
                         }
                     }
                     CyclicCommand::Stop { id, reply } => {
@@ -487,7 +500,8 @@ pub(crate) async fn run_scheduler(
                             completed = true;
                             break;
                         }
-                        let sent = enqueue(entry, &tx, &events, *state.borrow());
+                        let sent =
+                            enqueue(entry, &tx, &events, *state.borrow(), &global_stats);
                         if sent && let Some(remaining) = &mut entry.remaining {
                             *remaining = remaining.saturating_sub(1);
                             completed = *remaining == 0;
@@ -515,4 +529,5 @@ pub(crate) async fn run_scheduler(
         }
     }
     drop(control);
+    shutdown.disarm();
 }

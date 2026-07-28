@@ -327,3 +327,10 @@ impl Router {
         }
     }
 }
+
+impl Drop for Router {
+    fn drop(&mut self) {
+        // supervisor 因 panic 展開時也必須喚醒所有正在等待的訂閱者。
+        self.close_all();
+    }
+}

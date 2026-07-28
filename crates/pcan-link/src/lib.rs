@@ -1,4 +1,13 @@
 //! `pcan_kit` 的自動重連、路由、排程與交易監督層。
+//!
+//! 每條連線由 supervisor、傳送工作者與週期排程器共同維護。背景工作者以
+//! RAII 守衛收斂異常結束；在 panic 採 unwind 或 future 被執行期丟棄時，
+//! 連線狀態會推到 `Closed`，訂閱與等待中的操作也會被喚醒。若程式使用
+//! `panic = "abort"`，程序會直接終止，Rust 無法執行任何 `Drop` 守衛。
+//!
+//! 傳送背壓由 bounded channel 與工作者暫存佇列組成兩段，可透過
+//! [`Link::tx_queue_depth`] 觀測；[`LinkBuilder::tx_high_water_ratio`] 可設定
+//! 尚未塞滿前的主動降速事件。
 
 /// 連線建構器。
 pub mod builder;
@@ -29,7 +38,7 @@ pub use transaction::{
     CollectMode, MatchResult, Matcher, PendingResponse, PrefixPattern, RejectReason, ResponseSpec,
     TransactionError,
 };
-pub use txqueue::{PendingTxPolicy, TxGate};
+pub use txqueue::{PendingTxPolicy, TxGate, TxQueueDepth};
 
 #[cfg(feature = "tracing")]
 macro_rules! trace_debug {
@@ -58,3 +67,17 @@ macro_rules! trace_warn {
 }
 
 pub(crate) use trace_warn;
+
+#[cfg(feature = "tracing")]
+macro_rules! trace_error {
+    ($($arg:tt)*) => {
+        tracing::error!($($arg)*)
+    };
+}
+
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace_error {
+    ($($arg:tt)*) => {{}};
+}
+
+pub(crate) use trace_error;

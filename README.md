@@ -168,6 +168,38 @@ CAN FD 刻意不是 Cargo feature。`Frame` 永遠能表示 FD；驅動、核心
 錯誤，也不會在重連後補送危險的陳舊控制命令。安全關鍵命令可改用
 `FailFast`；遙測類且允許遺失的資料可用 `DropAll`。
 
+## 傳送背壓與生命週期
+
+傳送路徑有兩段固定上限的佇列：應用程式直接排入的 bounded channel，以及
+傳送工作者已取走、等待重連或送上匯流排的暫存段。兩段的單段容量都由
+`LinkBuilder::tx_queue_capacity` 設定。`Link::tx_queue_depth()` 會回傳
+`TxQueueDepth`：
+
+- `channel` 是 `try_send` 直接面對的排隊量，`utilization()` 可預測何時會
+  回傳 `Error::TxQueueFull`。
+- `staged` 是工作者已取走但尚未送出的排隊量。
+- `total()` 是兩段總積壓，適合觀察端到端延遲壓力。
+
+建構器預設以 `tx_high_water_ratio(Some(0.8))` 啟用主動背壓。channel 段
+越過門檻時廣播 `BusEvent::TxQueueHighWater`，跌回門檻減 0.15 時才廣播
+`BusEvent::TxQueueRecovered`；這段遲滯可避免門檻附近的事件風暴。傳入
+`None` 可停用。`StatsSnapshot::tx_queue_full` 只計算真正因 channel 已滿而
+被拒絕的排入次數；後端傳送錯誤則由 `tx_dropped` 表達。
+
+三個背景工作任務都有異常結束守衛。採用預設的 panic unwind 時，工作者
+panic 或 future 被執行期丟棄會廣播 `BusEvent::WorkerLost`；致命工作者遺失
+還會把連線推到 `LinkState::Closed`，讓狀態等待、訂閱與傳送操作結束而不會
+永久等待。`panic = "abort"` 會直接終止整個程序，無法執行 Rust 的 `Drop`
+守衛，因而不在這項保證內。
+
+最後一個 `Link` 複本被丟棄時，背景任務會自動關閉且 transport 只關閉一次。
+仍建議在正常關機流程明確呼叫 `link.close().await`，如此呼叫端能等待清理
+完成，而不是只依賴背景收攤。
+
+接收統計中，`rx_error_frames` 是透過 RX 串流收到的錯誤／狀態幀數，不包含
+健康檢查主動輪詢；`rx_hw_overrun` 與 `rx_queue_overrun` 依警告位元上升緣
+計數，同一個尚未清除的警告不會被重複高估。
+
 ## 主要設計取捨
 
 - `Frame` 固定 72 bytes 且為 `Copy`：一個值即可容納最大 64-byte FD

@@ -47,7 +47,7 @@ pub use pcan_link::{
     FaultCause, Jitter, Link, LinkAction, LinkBuilder, LinkInput, LinkMachine, LinkState,
     MatchResult, Matcher, NoJitter, OverflowPolicy, OverrunPolicy, PendingResponse,
     PendingTxPolicy, PrefixPattern, RejectReason, Repeat, ResponseSpec, SplitMixJitter,
-    SubscribeConfig, Subscription, SubscriptionId, TransactionError, TxGate,
+    SubscribeConfig, Subscription, SubscriptionId, TransactionError, TxGate, TxQueueDepth,
 };
 
 #[cfg(feature = "basic")]

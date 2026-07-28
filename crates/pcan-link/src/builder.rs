@@ -1,5 +1,5 @@
 use core::time::Duration;
-use std::sync::atomic::{AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pcan_core::{BusStatus, Error, FilterSet, Stats, TransportFactory};
@@ -20,6 +20,7 @@ pub struct LinkBuilder<F> {
     hardware_filter: FilterSet,
     open_timeout: Duration,
     tx_queue_capacity: usize,
+    tx_high_water_ratio: Option<f32>,
     pending_tx_policy: PendingTxPolicy,
     max_pending_age: Duration,
     tx_retry_limit: u32,
@@ -38,6 +39,7 @@ impl<F: TransportFactory> LinkBuilder<F> {
             hardware_filter: FilterSet::accept_all(),
             open_timeout: Duration::from_secs(5),
             tx_queue_capacity: 256,
+            tx_high_water_ratio: Some(0.8),
             pending_tx_policy: PendingTxPolicy::Hold,
             max_pending_age: Duration::from_secs(1),
             tx_retry_limit: 8,
@@ -83,6 +85,23 @@ impl<F: TransportFactory> LinkBuilder<F> {
     #[must_use]
     pub const fn tx_queue_capacity(mut self, capacity: usize) -> Self {
         self.tx_queue_capacity = capacity;
+        self
+    }
+
+    /// 設定傳送佇列高水位比例，超過時廣播
+    /// [`BusEvent::TxQueueHighWater`](crate::BusEvent::TxQueueHighWater)。
+    ///
+    /// 傳入 `None` 停用。合法範圍為 `0.0..=1.0`，超出範圍會夾到邊界；
+    /// `NaN` 會回復預設值 `0.8`。預設為 `Some(0.8)`。
+    #[must_use]
+    pub fn tx_high_water_ratio(mut self, ratio: Option<f32>) -> Self {
+        self.tx_high_water_ratio = ratio.map(|value| {
+            if value.is_nan() {
+                0.8
+            } else {
+                value.clamp(0.0, 1.0)
+            }
+        });
         self
     }
 
@@ -150,9 +169,12 @@ impl<F: TransportFactory> LinkBuilder<F> {
         let bus_status = Arc::new(Mutex::new(BusStatus::default()));
         let capabilities = Arc::new(Mutex::new(None));
         let in_flight = Arc::new(AtomicUsize::new(0));
+        let tx_staged = Arc::new(AtomicUsize::new(0));
+        let tx_high_water = Arc::new(AtomicBool::new(false));
         let raw = Arc::new(OnceLock::new());
         let runtime = RuntimeConfig {
             tx_capacity,
+            tx_high_water_ratio: self.tx_high_water_ratio,
             pending_policy: self.pending_tx_policy,
             max_pending_age: self.max_pending_age,
             tx_retry_limit: self.tx_retry_limit,
@@ -169,6 +191,8 @@ impl<F: TransportFactory> LinkBuilder<F> {
             bus_status: Arc::clone(&bus_status),
             capabilities: Arc::clone(&capabilities),
             in_flight: Arc::clone(&in_flight),
+            tx_staged: Arc::clone(&tx_staged),
+            tx_high_water: Arc::clone(&tx_high_water),
             raw: Arc::clone(&raw),
         };
         let channels = spawn(
@@ -188,9 +212,12 @@ impl<F: TransportFactory> LinkBuilder<F> {
                 bus_status,
                 capabilities,
                 in_flight,
+                tx_staged,
+                tx_high_water,
                 raw,
                 pending_policy: self.pending_tx_policy,
                 tx_capacity,
+                tx_high_water_ratio: self.tx_high_water_ratio,
                 cyclic_next: AtomicU64::new(1),
             }),
         }

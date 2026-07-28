@@ -212,6 +212,7 @@ async fn full_tx_queue_counts_skip_and_emits_drop_event() {
     tokio::time::advance(Duration::from_millis(100)).await;
     settle().await;
     assert!(cyclic.stats().skipped > 0);
+    assert!(link.stats().tx_queue_full > 0);
     let mut saw_drop = false;
     while let Ok(event) = events.try_recv() {
         if matches!(event, BusEvent::TxDropped { .. }) {

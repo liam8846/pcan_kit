@@ -1,4 +1,4 @@
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::time::Duration;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -8,7 +8,43 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::events::BusEvent;
+use crate::supervisor::guard::ShutdownGuard;
 use crate::supervisor::{RuntimeConfig, SupervisorCommand};
+
+/// 傳送佇列的即時水位快照。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub struct TxQueueDepth {
+    /// 已排入但尚未被傳送工作者取走的幀數（channel 段）。
+    pub channel: usize,
+    /// 已取走但尚未送上匯流排的待送幀數（暫存段）。
+    pub staged: usize,
+    /// 單段容量，即 `LinkBuilder::tx_queue_capacity` 設定值。
+    pub capacity: usize,
+}
+
+impl TxQueueDepth {
+    /// 取得 channel 與暫存兩段合計的積壓幀數。
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.channel.saturating_add(self.staged)
+    }
+
+    /// 取得 channel 段相對於單段容量的使用比例。
+    ///
+    /// 這是預測 `Link::try_send` 何時回傳 `Error::TxQueueFull` 的指標，因為
+    /// `try_send` 只會直接撞到 channel 段；延遲觀測則應搭配
+    /// [`total`](Self::total) 查看兩段總積壓。
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn utilization(&self) -> f32 {
+        if self.capacity == 0 {
+            0.0
+        } else {
+            self.channel as f32 / self.capacity as f32
+        }
+    }
+}
 
 /// 斷線期間待送幀的處置策略。
 ///
@@ -71,7 +107,44 @@ fn expiry_deadline(pending: &VecDeque<TxItem>, max_age: Duration) -> Option<Inst
         .and_then(|item| item.queued_at.checked_add(max_age))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::cast_precision_loss)]
+fn publish_depth(
+    receiver: &mpsc::Receiver<TxItem>,
+    staged: &AtomicUsize,
+    pending_len: usize,
+    ratio: Option<f32>,
+    high_water: &AtomicBool,
+    events: &broadcast::Sender<BusEvent>,
+) {
+    staged.store(pending_len, Ordering::Relaxed);
+    let Some(ratio) = ratio else {
+        return;
+    };
+    let capacity = receiver.max_capacity();
+    let queued = receiver.len();
+    let utilization = queued as f32 / capacity as f32;
+    if utilization > ratio
+        && high_water
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let _receivers = events.send(BusEvent::TxQueueHighWater {
+            queued: u32::try_from(queued).unwrap_or(u32::MAX),
+            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+        });
+    } else if utilization <= (ratio - 0.15).max(0.0)
+        && high_water
+            .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let _receivers = events.send(BusEvent::TxQueueRecovered {
+            queued: u32::try_from(queued).unwrap_or(u32::MAX),
+            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_tx<T: Transport>(
     mut receiver: mpsc::Receiver<TxItem>,
     mut transport: watch::Receiver<Option<Arc<T>>>,
@@ -79,13 +152,25 @@ pub(crate) async fn run_tx<T: Transport>(
     supervisor: mpsc::Sender<SupervisorCommand>,
     events: broadcast::Sender<BusEvent>,
     stats: Arc<Stats>,
+    staged: Arc<AtomicUsize>,
+    high_water: Arc<AtomicBool>,
     config: RuntimeConfig,
+    mut shutdown: ShutdownGuard,
 ) {
     let mut pending = VecDeque::with_capacity(config.tx_capacity);
     loop {
+        publish_depth(
+            &receiver,
+            &staged,
+            pending.len(),
+            config.tx_high_water_ratio,
+            &high_water,
+            &events,
+        );
         let current_gate = *gate.borrow();
         if current_gate == TxGate::Open {
             let item = pending.pop_front().or_else(|| receiver.try_recv().ok());
+            staged.store(pending.len(), Ordering::Relaxed);
             if let Some(mut item) = item {
                 if Instant::now().duration_since(item.queued_at) >= config.max_pending_age {
                     stats.inc_tx_dropped();
@@ -129,7 +214,6 @@ pub(crate) async fn run_tx<T: Transport>(
                                 let _ignored =
                                     supervisor.send(SupervisorCommand::TxFault(kind)).await;
                             } else {
-                                stats.inc_tx_queue_full();
                                 stats.inc_tx_dropped();
                                 let _receivers = events.send(BusEvent::TxDropped { count: 1 });
                                 if let Some(completion) = item.completion.take() {
@@ -158,6 +242,7 @@ pub(crate) async fn run_tx<T: Transport>(
                 stats.tx_dropped.fetch_add(count, Ordering::Relaxed);
                 let _receivers = events.send(BusEvent::TxDropped { count });
             }
+            staged.store(pending.len(), Ordering::Relaxed);
         } else {
             while pending.len() < config.tx_capacity {
                 match receiver.try_recv() {
@@ -165,6 +250,7 @@ pub(crate) async fn run_tx<T: Transport>(
                     Err(_) => break,
                 }
             }
+            staged.store(pending.len(), Ordering::Relaxed);
             let now = Instant::now();
             let mut count = 0_u64;
             while pending
@@ -184,8 +270,17 @@ pub(crate) async fn run_tx<T: Transport>(
                 stats.tx_dropped.fetch_add(count, Ordering::Relaxed);
                 let _receivers = events.send(BusEvent::TxDropped { count });
             }
+            staged.store(pending.len(), Ordering::Relaxed);
         }
 
+        publish_depth(
+            &receiver,
+            &staged,
+            pending.len(),
+            config.tx_high_water_ratio,
+            &high_water,
+            &events,
+        );
         let expiry = expiry_deadline(&pending, config.max_pending_age);
         let expires_at = expiry.unwrap_or_else(Instant::now);
         tokio::select! {
@@ -202,5 +297,57 @@ pub(crate) async fn run_tx<T: Transport>(
             () = tokio::time::sleep_until(expires_at),
                 if current_gate == TxGate::Hold && expiry.is_some() => {}
         }
+    }
+    staged.store(0, Ordering::Relaxed);
+    shutdown.disarm();
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicBool, AtomicUsize};
+
+    use pcan_core::{CanId, Frame};
+    use tokio::sync::{broadcast, mpsc};
+
+    use super::{TxItem, publish_depth};
+    use crate::BusEvent;
+
+    fn item(value: u8) -> TxItem {
+        let id = CanId::standard(0x123).expect("ID");
+        let frame = Frame::new(id, &[value]).expect("幀");
+        TxItem::fire_and_forget(frame)
+    }
+
+    #[test]
+    fn high_water_hysteresis_suppresses_threshold_event_storms() {
+        let (sender, mut receiver) = mpsc::channel(20);
+        let (events, mut event_rx) = broadcast::channel(64);
+        let staged = AtomicUsize::new(0);
+        let high_water = AtomicBool::new(false);
+        for value in 0..17 {
+            sender.try_send(item(value)).expect("填入高水位");
+        }
+        publish_depth(&receiver, &staged, 0, Some(0.8), &high_water, &events);
+
+        for value in 0..100 {
+            let _item = receiver.try_recv().expect("回落至門檻");
+            publish_depth(&receiver, &staged, 0, Some(0.8), &high_water, &events);
+            sender.try_send(item(value)).expect("再次越過門檻");
+            publish_depth(&receiver, &staged, 0, Some(0.8), &high_water, &events);
+        }
+        for _ in 0..4 {
+            let _item = receiver.try_recv().expect("跌回低水位");
+        }
+        publish_depth(&receiver, &staged, 0, Some(0.8), &high_water, &events);
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(BusEvent::TxQueueHighWater { .. })
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(BusEvent::TxQueueRecovered { .. })
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 }
