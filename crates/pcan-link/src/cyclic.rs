@@ -152,9 +152,11 @@ impl CyclicHandle {
             return Err(Error::Unsupported("週期幀新舊酬載長度必須相同"));
         }
         let mut payload = [0; 64];
+        let len = u8::try_from(data.len())
+            .ok()
+            .filter(|value| usize::from(*value) <= payload.len())
+            .ok_or(Error::Unsupported("週期幀酬載長度超過 64"))?;
         payload[..data.len()].copy_from_slice(data);
-        let len =
-            u8::try_from(data.len()).map_err(|_| Error::Unsupported("週期幀酬載長度超過 64"))?;
         self.control
             .send(CyclicCommand::SetPayload {
                 id: self.id,
@@ -345,6 +347,21 @@ fn find_entry(entries: &mut [Entry], id: CyclicId) -> Option<&mut Entry> {
     entries.iter_mut().find(|entry| entry.id == id)
 }
 
+/// 將酬載就地套用到週期項目的幀上。
+///
+/// 併發的 [`CyclicHandle::set_frame`] 可能已經改變幀長度，使先前通過長度檢查的
+/// 酬載更新變成陳舊指令。此時直接忽略，而不是截斷或補零送出錯誤的資料。
+///
+/// 回傳是否實際套用，供測試與統計判讀。
+fn apply_payload(entry: &mut Entry, payload: &[u8; 64], len: u8) -> bool {
+    let data = entry.config.frame.data_mut();
+    if data.len() != usize::from(len) {
+        return false;
+    }
+    data.copy_from_slice(&payload[..usize::from(len)]);
+    true
+}
+
 fn enqueue(
     entry: &Entry,
     sender: &mpsc::Sender<TxItem>,
@@ -421,8 +438,7 @@ pub(crate) async fn run_scheduler(
                     }
                     CyclicCommand::SetPayload { id, payload, len } => {
                         if let Some(entry) = find_entry(&mut entries, id) {
-                            entry.config.frame.data_mut()[..usize::from(len)]
-                                .copy_from_slice(&payload[..usize::from(len)]);
+                            let _applied = apply_payload(entry, &payload, len);
                         }
                     }
                     CyclicCommand::SetFrame { id, frame } => {
@@ -530,4 +546,82 @@ pub(crate) async fn run_scheduler(
     }
     drop(control);
     shutdown.disarm();
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::AtomicUsize;
+
+    use pcan_core::{CanId, Frame};
+
+    use super::{CyclicConfig, CyclicId, Entry, SharedStats, apply_payload};
+
+    /// 以指定幀建立可供酬載套用測試的週期項目。
+    fn entry(frame: Frame) -> Entry {
+        Entry {
+            id: CyclicId(1),
+            config: CyclicConfig::new(frame, core::time::Duration::from_millis(10)),
+            next: tokio::time::Instant::now(),
+            paused: false,
+            remaining: None,
+            generation: 0,
+            payload_len: std::sync::Arc::new(AtomicUsize::new(frame.data().len())),
+            stats: std::sync::Arc::new(SharedStats::default()),
+        }
+    }
+
+    /// 驗證長度相符時會完整更新幀資料。
+    #[test]
+    fn matching_payload_is_applied() {
+        let id = CanId::standard(0x123).expect("ID");
+        let mut entry = entry(Frame::new(id, &[0; 8]).expect("幀"));
+        let payload = [7; 64];
+
+        assert!(apply_payload(&mut entry, &payload, 8));
+        assert_eq!(entry.config.frame.data(), &[7; 8]);
+    }
+
+    /// 驗證幀變短後會忽略陳舊的較長酬載。
+    #[test]
+    fn stale_payload_is_ignored_when_frame_shrinks() {
+        let id = CanId::standard(0x123).expect("ID");
+        let mut entry = entry(Frame::new(id, &[3; 2]).expect("幀"));
+        let payload = [7; 64];
+
+        assert!(!apply_payload(&mut entry, &payload, 8));
+        assert_eq!(entry.config.frame.data(), &[3; 2]);
+    }
+
+    /// 驗證幀變長後會忽略陳舊的較短酬載。
+    #[test]
+    fn stale_payload_is_ignored_when_frame_grows() {
+        let id = CanId::standard(0x123).expect("ID");
+        let mut entry = entry(Frame::new(id, &[3; 8]).expect("幀"));
+        let payload = [7; 64];
+
+        assert!(!apply_payload(&mut entry, &payload, 2));
+        assert_eq!(entry.config.frame.data(), &[3; 8]);
+    }
+
+    /// 驗證遠端幀會忽略非零長度的酬載。
+    #[test]
+    fn non_empty_payload_is_ignored_for_remote_frame() {
+        let id = CanId::standard(0x123).expect("ID");
+        let mut entry = entry(Frame::remote(id, 8).expect("遠端幀"));
+        let payload = [7; 64];
+
+        assert!(!apply_payload(&mut entry, &payload, 8));
+        assert!(entry.config.frame.data().is_empty());
+    }
+
+    /// 驗證遠端幀可合法套用零長度酬載。
+    #[test]
+    fn empty_payload_is_applied_to_remote_frame() {
+        let id = CanId::standard(0x123).expect("ID");
+        let mut entry = entry(Frame::remote(id, 8).expect("遠端幀"));
+        let payload = [7; 64];
+
+        assert!(apply_payload(&mut entry, &payload, 0));
+        assert!(entry.config.frame.data().is_empty());
+    }
 }
