@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 檢查已知漏洞
         uses: EmbarkStudios/cargo-deny-action@v2

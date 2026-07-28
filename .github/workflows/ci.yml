@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -39,7 +39,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -63,7 +63,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
       - name: 快取 Rust 建置資料
@@ -87,7 +87,7 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
       - name: 快取 Rust 建置資料
@@ -103,7 +103,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 讀取宣告的最低支援版本
         id: msrv
         shell: bash
@@ -130,7 +130,7 @@ jobs:
     continue-on-error: true
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
       - name: 快取虛擬 CAN 建置資料
@@ -176,7 +176,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: 取出完整版本歷史
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: 判斷是否需要執行
@@ -229,7 +229,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 執行供應鏈稽核
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
@@ -242,7 +242,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: 檢查 Rust 文件語言
         run: python3 .github/scripts/check_cjk_docs.py
 

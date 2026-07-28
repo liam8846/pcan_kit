@@ -27,7 +27,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
