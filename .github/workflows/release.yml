@@ -25,7 +25,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
@@ -68,7 +68,7 @@ jobs:
           Compress-Archive -Path "dist/$package" -DestinationPath "dist/$package.zip" -CompressionLevel Optimal
 
       - name: 上傳平台發行檔
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.target }}
           path: dist/*.${{ matrix.archive }}
@@ -81,7 +81,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: 下載所有平台發行檔
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: release-*
           path: release

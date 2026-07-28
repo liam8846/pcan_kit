@@ -27,7 +27,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: 取出原始碼
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安裝 Rust 工具鏈
         uses: dtolnay/rust-toolchain@stable
@@ -48,10 +48,10 @@ jobs:
           printf '%s\n' '<!doctype html><meta http-equiv="refresh" content="0; url=pcan_kit/index.html">' > target/doc/index.html
 
       - name: 設定 GitHub Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: 上傳 Pages 成品
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: target/doc
 
