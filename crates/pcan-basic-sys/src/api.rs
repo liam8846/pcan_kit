@@ -446,9 +446,12 @@ mod tests {
 
     #[test]
     fn unavailable_driver_returns_clean_not_found() {
-        if let Err(LoadError::NotFound { tried, .. }) = super::load() {
-            assert!(!tried.is_empty());
+        match super::load() {
+            Err(LoadError::NotFound { tried, .. }) => assert!(!tried.is_empty()),
+            Err(other) => panic!("未安裝驅動時應回 NotFound，實際：{other:?}"),
+            Ok(_) => {
+                // 測試主機已安裝 PCAN-Basic，載入成功亦屬合法。
+            }
         }
-        // 測試主機若已安裝 PCAN-Basic，載入成功或版本不符亦證明沒有 panic。
     }
 }

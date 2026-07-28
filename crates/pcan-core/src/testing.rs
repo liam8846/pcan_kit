@@ -249,11 +249,12 @@ impl Transport for FakeTransport {
                 if !state.is_open {
                     return Err(Error::Closed);
                 }
-                if let Some((after, kind)) = state.fault_after {
-                    if !state.fault_after_fired && state.delivered_events >= after {
-                        state.fault_after_fired = true;
-                        return Err(Error::Io(fake_backend(kind, "recv")));
-                    }
+                if let Some((after, kind)) = state.fault_after
+                    && !state.fault_after_fired
+                    && state.delivered_events >= after
+                {
+                    state.fault_after_fired = true;
+                    return Err(Error::Io(fake_backend(kind, "recv")));
                 }
             }
 

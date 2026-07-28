@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 
 [lints]
 workspace = true
@@ -17,6 +18,7 @@ socketcan = ["dep:pcan-socketcan"]
 tracing = ["pcan-link/tracing"]
 serde = ["pcan-core/serde"]
 test-util = ["pcan-core/test-util"]
+vcan-tests = ["socketcan"]
 
 [dependencies]
 pcan-core = { workspace = true }

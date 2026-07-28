@@ -148,12 +148,11 @@ async fn apply_input<F: TransportFactory>(
                     *context.stable_deadline = None;
                 }
                 LinkAction::Emit(mut event) => {
-                    if let BusEvent::Reconnecting { cause, .. } = &mut event {
-                        if *cause == FaultCause::ReadFailed
-                            && context.fault_cause == FaultCause::WriteFailed
-                        {
-                            *cause = FaultCause::WriteFailed;
-                        }
+                    if let BusEvent::Reconnecting { cause, .. } = &mut event
+                        && *cause == FaultCause::ReadFailed
+                        && context.fault_cause == FaultCause::WriteFailed
+                    {
+                        *cause = FaultCause::WriteFailed;
                     }
                     if matches!(event, BusEvent::Connected { attempt } if attempt > 0) {
                         context.shared.stats.inc_reconnects();
