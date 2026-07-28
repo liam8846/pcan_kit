@@ -382,6 +382,8 @@ struct TransactionSlot {
     id: u64,
     matcher: Matcher,
     sender: mpsc::Sender<TransactionSignal>,
+    /// 因等待者緩衝已滿而被丟棄的幀數。
+    dropped: u64,
 }
 
 #[derive(Debug)]
@@ -419,6 +421,7 @@ impl TransactionTable {
                     id,
                     matcher,
                     sender,
+                    dropped: 0,
                 });
                 let _ignored = reply.send(Ok((id, receiver)));
             }
@@ -430,8 +433,8 @@ impl TransactionTable {
         }
     }
 
-    pub(crate) fn dispatch(&mut self, frame: RxFrame) {
-        self.slots.retain(|slot| {
+    pub(crate) fn dispatch(&mut self, frame: RxFrame, mut on_drop: impl FnMut(u64)) {
+        self.slots.retain_mut(|slot| {
             let signal = match slot.matcher.evaluate(&frame) {
                 MatchResult::NoMatch => return true,
                 MatchResult::Accept | MatchResult::AcceptAndFinish => {
@@ -439,7 +442,20 @@ impl TransactionTable {
                 }
                 MatchResult::Reject(reason) => TransactionSignal::Rejected(reason),
             };
-            slot.sender.try_send(signal).is_ok() && !slot.sender.is_closed()
+            match slot.sender.try_send(signal) {
+                Ok(()) => !slot.sender.is_closed(),
+                // 等待者仍在，只是緩衝已滿。保留登記並丟棄這一幀，讓等待者
+                // 取得已收集的幀，而不是被誤判為斷線。
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    slot.dropped = slot.dropped.saturating_add(1);
+                    if slot.dropped == 1 {
+                        on_drop(slot.id);
+                    }
+                    true
+                }
+                // 等待者已消失，移除登記。
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
         });
     }
 

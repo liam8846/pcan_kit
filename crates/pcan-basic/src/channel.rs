@@ -15,7 +15,7 @@ use pcan_core::{
     BackendError, Bitrate, BusStatus, Capabilities, Error, FaultKind, FilterSet, Frame, Transport,
     TransportEvent, TransportFactory,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::{PcanConfig, classic_baudrate, fd_bitrate_string};
 use crate::convert::{frame_to_msg, frame_to_msg_fd};
@@ -67,6 +67,16 @@ fn cleanup(api: &PcanApi, handle: TPCANHandle) {
         #[cfg(feature = "tracing")]
         tracing::warn!(status, handle, "清理失敗通道時 CAN_Uninitialize 回報錯誤");
     }
+}
+
+/// 將 PCAN 開啟工作本身的執行期故障轉為既有後端錯誤。
+fn open_task_error(text: impl Into<Box<str>>, operation: &'static str) -> Error {
+    Error::Io(BackendError::PcanBasic {
+        code: 0,
+        text: text.into(),
+        op: operation,
+        kind: FaultKind::Fatal,
+    })
 }
 
 fn filter_range(filter: &FilterSet) -> Option<(u32, u32, u8)> {
@@ -326,10 +336,13 @@ impl Transport for PcanChannel {
 }
 
 /// 依設定開啟 [`PcanChannel`] 的工廠。
+#[derive(Clone)]
 pub struct PcanFactory {
     config: PcanConfig,
     api: Arc<PcanApi>,
     describe: String,
+    /// 序列化開啟嘗試，避免逾時遺棄的開啟與後續重試互相破壞。
+    open_gate: Arc<Semaphore>,
 }
 
 impl core::fmt::Debug for PcanFactory {
@@ -339,6 +352,7 @@ impl core::fmt::Debug for PcanFactory {
             .field("config", &self.config)
             .field("api", &self.api)
             .field("describe", &self.describe)
+            .field("open_gate", &self.open_gate)
             .finish()
     }
 }
@@ -378,6 +392,7 @@ impl PcanFactory {
             config,
             api,
             describe,
+            open_gate: Arc::new(Semaphore::new(1)),
         })
     }
 
@@ -533,7 +548,24 @@ impl TransportFactory for PcanFactory {
     type Transport = PcanChannel;
 
     fn open(&self) -> impl Future<Output = Result<Self::Transport, Error>> + Send {
-        core::future::ready(self.open_channel())
+        let factory = self.clone();
+        async move {
+            let permit = Arc::clone(&factory.open_gate)
+                .acquire_owned()
+                .await
+                .map_err(|_| open_task_error("PCAN 開啟閘門已關閉", "等待 PCAN 開啟閘門"))?;
+
+            // 阻塞 FFI 與 RX 執行緒建立不得佔用非同步執行期工作執行緒。
+            // 結果排在 permit 前方，使逾時後由 runtime 丟棄工作輸出時，先
+            // 關閉成功開啟的通道，再允許下一次開啟嘗試進入。
+            match tokio::task::spawn_blocking(move || (factory.open_channel(), permit)).await {
+                Ok((result, _permit)) => result,
+                Err(source) => Err(open_task_error(
+                    source.to_string(),
+                    "等待 PCAN 阻塞開啟工作",
+                )),
+            }
+        }
     }
 
     fn describe(&self) -> &str {
@@ -545,7 +577,14 @@ impl TransportFactory for PcanFactory {
 mod tests {
     use pcan_core::{CanId, FilterRule, FilterSet};
 
-    use super::filter_range;
+    use super::{PcanFactory, filter_range};
+
+    #[test]
+    fn factory_is_clone_send_and_sync() {
+        fn assert_traits<T: Clone + Send + Sync>() {}
+
+        assert_traits::<PcanFactory>();
+    }
 
     #[test]
     fn only_contiguous_single_ranges_are_pushed_down() {

@@ -5,7 +5,9 @@ use core::time::Duration;
 
 use pcan_core::testing::{FakeFactory, FakeHandle, FakeTransportBuilder};
 use pcan_core::{CanId, Frame, RxFrame, Timestamp, TimestampSource, TransportEvent};
-use pcan_link::{CollectMode, Link, Matcher, PrefixPattern, ResponseSpec, TransactionError};
+use pcan_link::{
+    BusEvent, CollectMode, Link, Matcher, PrefixPattern, ResponseSpec, TransactionError,
+};
 
 fn frame(id: u16, data: &[u8]) -> Frame {
     Frame::new(CanId::standard(id).expect("ID"), data).expect("幀")
@@ -170,4 +172,79 @@ async fn fatal_disconnect_wakes_waiter_without_advancing_timeout() {
         task.await.expect("task"),
         Err(TransactionError::Disconnected)
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_window_buffer_returns_collected_frames_instead_of_disconnect() {
+    let (factory, handle) = FakeFactory::new(FakeTransportBuilder::default());
+    let link = Link::builder(factory).health_check_interval(None).build();
+    link.wait_connected().await.expect("連線");
+    let spec = ResponseSpec::new(
+        Matcher::Id(CanId::standard(0x555).expect("ID")),
+        Duration::from_secs(1),
+    )
+    .with_mode(CollectMode::Window(Duration::from_millis(10)));
+    let pending = link.prepare(&spec).await.expect("註冊等待者");
+
+    for value in 0_u8..70 {
+        inject(&handle, 0x555, &[value]);
+    }
+    while link.stats().rx_frames < 70 {
+        tokio::task::yield_now().await;
+    }
+    settle().await;
+
+    let frames = pending.wait_many().await.expect("窗口收集應成功");
+    assert_eq!(frames.len(), 64);
+}
+
+#[tokio::test(start_paused = true)]
+async fn disappeared_waiter_is_removed_after_matching_frame() {
+    let (factory, handle) = FakeFactory::new(FakeTransportBuilder::default());
+    let link = Link::builder(factory).health_check_interval(None).build();
+    link.wait_connected().await.expect("連線");
+    let spec = ResponseSpec::new(
+        Matcher::Id(CanId::standard(0x555).expect("ID")),
+        Duration::from_secs(1),
+    );
+    let pending = link.prepare(&spec).await.expect("註冊等待者");
+    assert_eq!(link.in_flight_count(), 1);
+
+    drop(pending);
+    inject(&handle, 0x555, &[1]);
+    while link.stats().rx_frames < 1 {
+        tokio::task::yield_now().await;
+    }
+    settle().await;
+
+    assert_eq!(link.in_flight_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn transaction_drop_event_is_edge_triggered() {
+    let (factory, handle) = FakeFactory::new(FakeTransportBuilder::default());
+    let link = Link::builder(factory).health_check_interval(None).build();
+    link.wait_connected().await.expect("連線");
+    let mut events = link.events();
+    let spec = ResponseSpec::new(
+        Matcher::Id(CanId::standard(0x555).expect("ID")),
+        Duration::from_secs(1),
+    )
+    .with_mode(CollectMode::Window(Duration::from_millis(10)));
+    let pending = link.prepare(&spec).await.expect("註冊等待者");
+
+    for value in 0_u8..70 {
+        inject(&handle, 0x555, &[value]);
+    }
+    while link.stats().rx_frames < 70 {
+        tokio::task::yield_now().await;
+    }
+    settle().await;
+
+    let dropped_events = core::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| matches!(event, BusEvent::TransactionDropped { .. }))
+        .count();
+    assert_eq!(dropped_events, 1);
+
+    let _frames = pending.wait_many().await.expect("窗口收集應成功");
 }

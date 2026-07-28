@@ -84,6 +84,11 @@ pub enum BusEvent {
         /// 本次重送次數。
         attempt: u8,
     },
+    /// 交易等待者的緩衝已滿，該交易至少有一幀被丟棄，結果將不完整。
+    TransactionDropped {
+        /// 發生丟棄的交易識別碼。
+        transaction: u64,
+    },
     /// 連線已由使用者關閉。
     Closed,
     /// 永久失敗，不再重連。
