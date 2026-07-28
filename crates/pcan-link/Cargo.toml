@@ -1,0 +1,25 @@
+[package]
+name = "pcan-link"
+description = "pcan_kit 的連線監督層：自動重連、訂閱路由、傳送佇列、週期傳送與請求-回應交易"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["tracing"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+pcan-core = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+thiserror = { workspace = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+pcan-core = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }
