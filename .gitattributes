@@ -1,0 +1,2 @@
+# 統一以 LF 儲存，避免 Windows/WSL 檢出造成 CRLF 換行雜訊
+* text=auto eol=lf
