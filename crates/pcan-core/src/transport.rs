@@ -18,6 +18,16 @@ pub struct Capabilities {
     pub brs: bool,
     /// 是否能接收本地送出幀的回音。
     pub echo_frames: bool,
+    /// 是否實際能提供錯誤幀。
+    ///
+    /// 此欄位是開啟通道時的執行期協商結果；裝置不支援錯誤幀參數時會是
+    /// `false`。
+    pub error_frames: bool,
+    /// 是否實際能提供狀態幀。
+    ///
+    /// 此欄位是開啟通道時的執行期協商結果；裝置不支援狀態幀參數時會是
+    /// `false`。
+    pub status_frames: bool,
     /// 後端是否具備在硬體或作業系統核心層套用過濾器的能力。
     ///
     /// 此欄位只描述後端具備此能力，不保證每個 [`FilterSet`] 都會實際下推。

@@ -149,6 +149,11 @@ CAN FD 刻意不是 Cargo feature。`Frame` 永遠能表示 FD；驅動、核心
 硬體是否實際支援，是執行期性質，應查詢 `Link::capabilities()` 的
 `Capabilities::can_fd`／`brs`，而不是編譯兩套協定型別。
 
+部分 PCAN 裝置不支援錯誤幀或狀態幀參數；這些可選參數設定失敗時仍會建立
+連線，並由 `Capabilities::error_frames`／`status_frames` 回報執行期協商後
+實際可用的能力。明確要求但裝置無法提供時會以 warn 等級記錄；原本即關閉
+的能力則只以 debug 等級記錄。
+
 ## 錯誤分類與重連
 
 `FaultKind` 決定監督器處置：

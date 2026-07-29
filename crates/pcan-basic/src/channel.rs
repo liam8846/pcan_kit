@@ -41,24 +41,41 @@ fn backend_error(
 }
 
 fn required_status(api: &PcanApi, status: u32, operation: &'static str) -> Result<(), Error> {
+    let Some(fallback) = required_status_fault(status) else {
+        return Ok(());
+    };
+    Err(Error::Io(backend_error(api, status, operation, fallback)))
+}
+
+fn required_status_fault(status: u32) -> Option<FaultKind> {
     match classify(status) {
-        StatusOutcome::Ok { .. } => Ok(()),
-        StatusOutcome::Empty { .. } | StatusOutcome::TxBusy { .. } => Err(Error::Io(
-            backend_error(api, status, operation, FaultKind::Transient),
-        )),
-        StatusOutcome::Failed { .. } => Err(Error::Io(backend_error(
-            api,
-            status,
-            operation,
-            FaultKind::Fatal,
-        ))),
-        _ => Err(Error::Io(backend_error(
-            api,
-            status,
-            operation,
-            FaultKind::Permanent,
-        ))),
+        StatusOutcome::Ok { .. } => None,
+        StatusOutcome::Empty { .. } | StatusOutcome::TxBusy { .. } => Some(FaultKind::Transient),
+        StatusOutcome::Failed { kind, .. } => Some(kind),
+        _ => Some(FaultKind::Permanent),
     }
+}
+
+fn optional_parameter_capability(requested: bool, status: u32, parameter: &'static str) -> bool {
+    let supported = matches!(classify(status), StatusOutcome::Ok { .. });
+    if !supported {
+        let _ = (requested, parameter);
+        #[cfg(feature = "tracing")]
+        if requested {
+            tracing::warn!(
+                status,
+                parameter,
+                "PCAN-Basic 無法提供要求的可選參數，能力回報已降級"
+            );
+        } else {
+            tracing::debug!(
+                status,
+                parameter,
+                "PCAN-Basic 不支援已關閉的可選參數，設定語意不受影響"
+            );
+        }
+    }
+    supported
 }
 
 fn cleanup(api: &PcanApi, handle: TPCANHandle) {
@@ -461,29 +478,38 @@ impl PcanFactory {
                 PCAN_PARAMETER_OFF
             }
         };
-        for (parameter, enabled, operation) in [
-            (
-                PCAN_LISTEN_ONLY,
-                self.config.common.listen_only,
-                "設定 PCAN_LISTEN_ONLY",
-            ),
-            (
-                PCAN_ALLOW_ERROR_FRAMES,
-                self.config.common.receive_error_frames,
-                "設定 PCAN_ALLOW_ERROR_FRAMES",
-            ),
-            (
-                PCAN_ALLOW_STATUS_FRAMES,
-                self.config.common.receive_status_frames,
-                "設定 PCAN_ALLOW_STATUS_FRAMES",
-            ),
-        ] {
-            let status = self.api.set_value_u32(handle, parameter, on_off(enabled));
-            if let Err(error) = required_status(&self.api, status, operation) {
-                cleanup(&self.api, handle);
-                return Err(error);
-            }
+        let listen_only_status = self.api.set_value_u32(
+            handle,
+            PCAN_LISTEN_ONLY,
+            on_off(self.config.common.listen_only),
+        );
+        if let Err(error) = required_status(&self.api, listen_only_status, "設定 PCAN_LISTEN_ONLY")
+        {
+            cleanup(&self.api, handle);
+            return Err(error);
         }
+
+        let error_frames_status = self.api.set_value_u32(
+            handle,
+            PCAN_ALLOW_ERROR_FRAMES,
+            on_off(self.config.common.receive_error_frames),
+        );
+        let error_frames = optional_parameter_capability(
+            self.config.common.receive_error_frames,
+            error_frames_status,
+            "PCAN_ALLOW_ERROR_FRAMES",
+        );
+
+        let status_frames_status = self.api.set_value_u32(
+            handle,
+            PCAN_ALLOW_STATUS_FRAMES,
+            on_off(self.config.common.receive_status_frames),
+        );
+        let status_frames = optional_parameter_capability(
+            self.config.common.receive_status_frames,
+            status_frames_status,
+            "PCAN_ALLOW_STATUS_FRAMES",
+        );
 
         let echo_status = self.api.set_value_u32(
             handle,
@@ -531,6 +557,8 @@ impl PcanFactory {
         caps.can_fd = fd_mode;
         caps.brs = fd_mode;
         caps.echo_frames = echo_frames;
+        caps.error_frames = error_frames;
+        caps.status_frames = status_frames;
         caps.hardware_filter = true;
         caps.hardware_timestamps = true;
         caps.listen_only = true;
@@ -577,9 +605,10 @@ impl TransportFactory for PcanFactory {
 
 #[cfg(test)]
 mod tests {
-    use pcan_core::{CanId, FilterRule, FilterSet};
+    use pcan_basic_sys::PCAN_ERROR_ILLPARAMVAL;
+    use pcan_core::{CanId, FaultKind, FilterRule, FilterSet};
 
-    use super::{PcanFactory, filter_range};
+    use super::{PcanFactory, filter_range, optional_parameter_capability, required_status_fault};
 
     #[test]
     fn factory_is_clone_send_and_sync() {
@@ -600,5 +629,41 @@ mod tests {
         let mut multiple = contiguous.clone();
         multiple.push(FilterRule::exact(id));
         assert_eq!(filter_range(&multiple), None);
+    }
+
+    #[test]
+    fn rejected_disabled_optional_parameters_are_unavailable_without_becoming_required() {
+        assert!(!optional_parameter_capability(
+            false,
+            PCAN_ERROR_ILLPARAMVAL,
+            "PCAN_ALLOW_ERROR_FRAMES"
+        ));
+        assert!(!optional_parameter_capability(
+            false,
+            PCAN_ERROR_ILLPARAMVAL,
+            "PCAN_ALLOW_STATUS_FRAMES"
+        ));
+    }
+
+    #[test]
+    fn rejected_requested_optional_parameters_degrade_capabilities() {
+        assert!(!optional_parameter_capability(
+            true,
+            PCAN_ERROR_ILLPARAMVAL,
+            "PCAN_ALLOW_ERROR_FRAMES"
+        ));
+        assert!(!optional_parameter_capability(
+            true,
+            PCAN_ERROR_ILLPARAMVAL,
+            "PCAN_ALLOW_STATUS_FRAMES"
+        ));
+    }
+
+    #[test]
+    fn rejected_listen_only_status_remains_a_required_failure() {
+        assert_eq!(
+            required_status_fault(PCAN_ERROR_ILLPARAMVAL),
+            Some(FaultKind::Permanent)
+        );
     }
 }
