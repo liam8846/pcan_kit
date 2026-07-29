@@ -321,7 +321,10 @@ pub(crate) fn spawn<F: TransportFactory>(
                             router.dispatch(frame, elapsed, |subscription, count| {
                                 let _receivers = events.send(BusEvent::RxDropped { subscription, count });
                             });
-                            transactions.dispatch(frame);
+                            transactions.dispatch(frame, |transaction| {
+                                let _receivers =
+                                    events.send(BusEvent::TransactionDropped { transaction });
+                            });
                             shared.in_flight.store(transactions.len(), Ordering::Release);
                         }
                         Ok(TransportEvent::Status(status)) => {

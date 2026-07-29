@@ -730,11 +730,16 @@ impl SocketCanFactory {
     }
 }
 
+#[allow(clippy::manual_async_fn)]
 impl TransportFactory for SocketCanFactory {
     type Transport = CanSocket;
 
     fn open(&self) -> impl Future<Output = Result<Self::Transport, Error>> + Send {
-        core::future::ready(CanSocket::open(&self.config))
+        async move {
+            // 這裡只有微秒級 socket 系統呼叫；保持惰性即可，送入阻塞池反而
+            // 會增加排程與跨執行緒成本。
+            CanSocket::open(&self.config)
+        }
     }
 
     fn describe(&self) -> &str {
