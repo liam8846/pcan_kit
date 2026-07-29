@@ -29,7 +29,14 @@ fn frame(id: u16, value: u8) -> Frame {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recv_panic_closes_link_and_reports_worker_loss() {
-    let (factory, _) = FakeFactory::new(FakeTransportBuilder::default().panic_on_recv());
+    // `build()` 會立即啟動監督任務，而 broadcast 訂閱只收得到訂閱之後發出的
+    // 事件。開啟延遲把監督任務停在 `open()` 的 await 點，確保下方的
+    // `link.events()` 一定早於 `recv()` panic 觸發的 `WorkerLost` 廣播。
+    let (factory, _) = FakeFactory::new(
+        FakeTransportBuilder::default()
+            .panic_on_recv()
+            .open_delay(Duration::from_millis(200)),
+    );
     let link = Link::builder(factory)
         .pending_tx_policy(PendingTxPolicy::FailFast)
         .health_check_interval(None)
