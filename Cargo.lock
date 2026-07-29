@@ -79,7 +79,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pcan-basic"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bitflags",
  "libc",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "pcan-basic-sys"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libloading",
  "pcan-core",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "pcan-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bitflags",
  "embedded-can",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "pcan-kit"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "pcan-basic",
  "pcan-core",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "pcan-link"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "pcan-core",
  "thiserror",
@@ -134,7 +134,7 @@ dependencies = [
 
 [[package]]
 name = "pcan-socketcan"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "libc",
  "pcan-core",
