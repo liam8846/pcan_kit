@@ -7,6 +7,7 @@ use std::sync::Arc;
 use pcan_core::testing::{FakeFactory, FakeTransportBuilder};
 use pcan_core::{CanId, Frame};
 use pcan_link::{BusEvent, CyclicConfig, Link, OverrunPolicy, Repeat};
+use tokio::sync::broadcast;
 
 async fn settle() {
     for _ in 0..32 {
@@ -284,10 +285,19 @@ async fn concurrent_frame_and_payload_updates_keep_scheduler_alive() {
         .expect("排程器應仍可接受新項目");
     probe.stop().await.expect("停止探測項目");
 
-    while let Ok(event) = events.try_recv() {
-        assert!(
-            !matches!(event, BusEvent::WorkerLost { worker: "cyclic" }),
-            "週期排程器不得因並行更新而異常結束"
-        );
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                assert!(
+                    !matches!(event, BusEvent::WorkerLost { worker: "cyclic" }),
+                    "週期排程器不得因並行更新而異常結束"
+                );
+            }
+            // `Lagged` 不可中止排空，否則「斷言事件不存在」會在溢位時靜默放行。
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                break;
+            }
+        }
     }
 }

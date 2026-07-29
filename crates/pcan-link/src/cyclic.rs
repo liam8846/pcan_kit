@@ -109,12 +109,15 @@ pub struct CyclicStats {
     pub sent: u64,
     /// 因斷線、落後或佇列壓力跳過的次數。
     pub skipped: u64,
+    /// 因併發改幀導致長度不符而被忽略的酬載更新次數。
+    pub stale_payloads: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct SharedStats {
     sent: AtomicU64,
     skipped: AtomicU64,
+    stale_payloads: AtomicU64,
 }
 
 /// 週期傳送控制代碼。
@@ -261,6 +264,7 @@ impl CyclicHandle {
         CyclicStats {
             sent: self.stats.sent.load(Ordering::Relaxed),
             skipped: self.stats.skipped.load(Ordering::Relaxed),
+            stale_payloads: self.stats.stale_payloads.load(Ordering::Relaxed),
         }
     }
 }
@@ -347,15 +351,16 @@ fn find_entry(entries: &mut [Entry], id: CyclicId) -> Option<&mut Entry> {
     entries.iter_mut().find(|entry| entry.id == id)
 }
 
-/// 將酬載就地套用到週期項目的幀上。
+/// 將酬載更新就地套用到週期項目的幀上。
 ///
 /// 併發的 [`CyclicHandle::set_frame`] 可能已經改變幀長度，使先前通過長度檢查的
-/// 酬載更新變成陳舊指令。此時直接忽略，而不是截斷或補零送出錯誤的資料。
-///
-/// 回傳是否實際套用，供測試與統計判讀。
+/// 酬載更新變成陳舊指令。長度不符時會忽略更新並計入
+/// [`CyclicStats::stale_payloads`]，而不是截斷或補零送出錯誤的資料；回傳值表示是否
+/// 實際套用。
 fn apply_payload(entry: &mut Entry, payload: &[u8; 64], len: u8) -> bool {
     let data = entry.config.frame.data_mut();
     if data.len() != usize::from(len) {
+        entry.stats.stale_payloads.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     data.copy_from_slice(&payload[..usize::from(len)]);
@@ -438,7 +443,7 @@ pub(crate) async fn run_scheduler(
                     }
                     CyclicCommand::SetPayload { id, payload, len } => {
                         if let Some(entry) = find_entry(&mut entries, id) {
-                            let _applied = apply_payload(entry, &payload, len);
+                            let _ = apply_payload(entry, &payload, len);
                         }
                     }
                     CyclicCommand::SetFrame { id, frame } => {
@@ -550,7 +555,7 @@ pub(crate) async fn run_scheduler(
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     use pcan_core::{CanId, Frame};
 
@@ -601,6 +606,20 @@ mod tests {
 
         assert!(!apply_payload(&mut entry, &payload, 2));
         assert_eq!(entry.config.frame.data(), &[3; 8]);
+    }
+
+    /// 驗證陳舊酬載會增加統計，而正常等長更新不會增加。
+    #[test]
+    fn stale_payload_updates_are_counted() {
+        let id = CanId::standard(0x123).expect("ID");
+        let mut entry = entry(Frame::new(id, &[3; 2]).expect("幀"));
+        let payload = [7; 64];
+
+        assert!(!apply_payload(&mut entry, &payload, 8));
+        assert_eq!(entry.stats.stale_payloads.load(Ordering::Relaxed), 1);
+
+        assert!(apply_payload(&mut entry, &payload, 2));
+        assert_eq!(entry.stats.stale_payloads.load(Ordering::Relaxed), 1);
     }
 
     /// 驗證遠端幀會忽略非零長度的酬載。
