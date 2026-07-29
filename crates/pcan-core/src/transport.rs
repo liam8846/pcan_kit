@@ -8,6 +8,9 @@ use crate::status::BusStatus;
 /// 後端在執行期實際可用的能力。
 ///
 /// crate 在編譯期永遠能表示 CAN FD 幀；個別裝置是否能使用則由本結構協商。
+/// 各欄位描述後端具備的能力，而非目前是否啟用該功能。例如即使
+/// `receive_error_frames` 設為 `false`，只要後端支援錯誤幀，
+/// [`error_frames`](Self::error_frames) 仍為 `true`。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[non_exhaustive]
 #[allow(clippy::struct_excessive_bools)]
@@ -17,7 +20,15 @@ pub struct Capabilities {
     /// 是否支援 CAN FD 位元率切換。
     pub brs: bool,
     /// 是否能接收本地送出幀的回音。
+    ///
+    /// 此欄位目前有已知語意落差：`pcan-basic` 回報後端能力，
+    /// `pcan-socketcan` 則回報使用者是否啟用；後續將另案統一，本次不改變
+    /// 既有行為。
     pub echo_frames: bool,
+    /// 後端是否具備接收錯誤幀的能力。
+    pub error_frames: bool,
+    /// 後端是否具備接收狀態幀的能力。
+    pub status_frames: bool,
     /// 後端是否具備在硬體或作業系統核心層套用過濾器的能力。
     ///
     /// 此欄位只描述後端具備此能力，不保證每個 [`FilterSet`] 都會實際下推。
