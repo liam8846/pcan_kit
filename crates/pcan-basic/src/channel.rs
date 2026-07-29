@@ -531,6 +531,9 @@ impl PcanFactory {
         caps.can_fd = fd_mode;
         caps.brs = fd_mode;
         caps.echo_frames = echo_frames;
+        // PCAN_ALLOW_ERROR_FRAMES 與 PCAN_ALLOW_STATUS_FRAMES 已由上方必要參數迴圈以 required_status 驗證；抵達此處代表驅動已接受兩者。
+        caps.error_frames = true;
+        caps.status_frames = true;
         caps.hardware_filter = true;
         caps.hardware_timestamps = true;
         caps.listen_only = true;

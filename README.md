@@ -190,6 +190,9 @@ CAN FD 刻意不是 Cargo feature。`Frame` 永遠能表示 FD；驅動、核心
 硬體是否實際支援，是執行期性質，應查詢 `Link::capabilities()` 的
 `Capabilities::can_fd`／`brs`，而不是編譯兩套協定型別。
 
+`Capabilities` 回報後端具備的能力，而非目前是否啟用個別功能。錯誤幀與狀態幀
+能力可分別透過 `Capabilities::error_frames`／`status_frames` 查詢。
+
 ## 錯誤分類與重連
 
 `FaultKind` 決定監督器處置：

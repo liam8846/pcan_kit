@@ -426,6 +426,8 @@ async fn capabilities_reflect_socket_configuration() {
     assert!(capabilities.can_fd);
     assert!(capabilities.brs);
     assert!(capabilities.echo_frames);
+    assert!(capabilities.error_frames);
+    assert!(!capabilities.status_frames);
     assert!(capabilities.hardware_filter);
     assert!(!capabilities.hardware_timestamps);
 }

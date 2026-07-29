@@ -456,6 +456,10 @@ impl CanSocket {
         caps.can_fd = fd_enabled;
         caps.brs = fd_enabled;
         caps.echo_frames = config.common.receive_own_frames;
+        // CAN_RAW_ERR_FILTER 必須設定成功才會繼續開啟流程，因此後端確實具備此能力。
+        caps.error_frames = true;
+        // SocketCAN 以錯誤幀推導匯流排狀態，沒有可獨立接收的狀態幀。
+        caps.status_frames = false;
         caps.hardware_filter = true;
         caps.hardware_timestamps = false;
         caps.listen_only = false;
