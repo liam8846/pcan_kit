@@ -1,6 +1,9 @@
 //! 直接取自 PCAN-Basic 公開標頭的通道、狀態、參數與位元率常數。
 
-use crate::{TPCANBaudrate, TPCANHandle, TPCANMessageType, TPCANMode, TPCANParameter, TPCANStatus};
+use crate::{
+    TPCANBaudrate, TPCANDevice, TPCANHandle, TPCANMessageType, TPCANMode, TPCANParameter,
+    TPCANStatus,
+};
 
 macro_rules! constant {
     ($(#[$meta:meta])* $name:ident: $ty:ty = $value:expr) => {
@@ -234,24 +237,70 @@ constant!(/// 寫入記錄文字參數。
 PCAN_LOG_TEXT: TPCANParameter = 0x0c);
 constant!(/// 通道狀況參數。
 PCAN_CHANNEL_CONDITION: TPCANParameter = 0x0d);
+constant!(/// 硬體名稱參數。
+PCAN_HARDWARE_NAME: TPCANParameter = 0x0e);
 constant!(/// 接收狀態參數。
 PCAN_RECEIVE_STATUS: TPCANParameter = 0x0f);
 constant!(/// 控制器編號參數。
 PCAN_CONTROLLER_NUMBER: TPCANParameter = 0x10);
-constant!(/// 11-bit 接受過濾器參數。
-PCAN_ACCEPTANCE_FILTER_11BIT: TPCANParameter = 0x14);
-constant!(/// 29-bit 接受過濾器參數。
-PCAN_ACCEPTANCE_FILTER_29BIT: TPCANParameter = 0x15);
-constant!(/// 允許狀態幀參數。
-PCAN_ALLOW_STATUS_FRAMES: TPCANParameter = 0x18);
-constant!(/// 允許 RTR 幀參數。
-PCAN_ALLOW_RTR_FRAMES: TPCANParameter = 0x19);
-constant!(/// 允許錯誤幀參數。
-PCAN_ALLOW_ERROR_FRAMES: TPCANParameter = 0x1a);
+constant!(/// 通道能力參數。
+PCAN_CHANNEL_FEATURES: TPCANParameter = 0x16);
 constant!(/// 位元率資訊參數。
-PCAN_BITRATE_INFO: TPCANParameter = 0x1d);
+PCAN_BITRATE_INFO: TPCANParameter = 0x18);
+constant!(/// 11-bit 接受過濾器參數。
+PCAN_ACCEPTANCE_FILTER_11BIT: TPCANParameter = 0x22);
+constant!(/// 29-bit 接受過濾器參數。
+PCAN_ACCEPTANCE_FILTER_29BIT: TPCANParameter = 0x23);
+constant!(/// 允許狀態幀參數。
+PCAN_ALLOW_STATUS_FRAMES: TPCANParameter = 0x1e);
+constant!(/// 允許 RTR 幀參數。
+PCAN_ALLOW_RTR_FRAMES: TPCANParameter = 0x1f);
+constant!(/// 允許錯誤幀參數。
+PCAN_ALLOW_ERROR_FRAMES: TPCANParameter = 0x20);
+constant!(/// 已連接通道數量參數。
+PCAN_ATTACHED_CHANNELS_COUNT: TPCANParameter = 0x2a);
+constant!(/// 已連接通道資訊陣列參數。
+PCAN_ATTACHED_CHANNELS: TPCANParameter = 0x2b);
 constant!(/// 允許回音幀參數。
-PCAN_ALLOW_ECHO_FRAMES: TPCANParameter = 0x1e);
+PCAN_ALLOW_ECHO_FRAMES: TPCANParameter = 0x2c);
+
+constant!(/// 硬體名稱緩衝長度，包含 NUL 終止符。
+MAX_LENGTH_HARDWARE_NAME: usize = 33);
+
+constant!(/// 未指定 PCAN 硬體種類。
+PCAN_NONE: TPCANDevice = 0x00);
+constant!(/// PEAK-CAN 硬體種類。
+PCAN_PEAKCAN: TPCANDevice = 0x01);
+constant!(/// ISA 硬體種類。
+PCAN_ISA: TPCANDevice = 0x02);
+constant!(/// Dongle 硬體種類。
+PCAN_DNG: TPCANDevice = 0x03);
+constant!(/// PCI 或 `PCIe` 硬體種類。
+PCAN_PCI: TPCANDevice = 0x04);
+constant!(/// USB 硬體種類。
+PCAN_USB: TPCANDevice = 0x05);
+constant!(/// PC Card 硬體種類。
+PCAN_PCC: TPCANDevice = 0x06);
+constant!(/// 虛擬 PCAN 硬體種類。
+PCAN_VIRTUAL: TPCANDevice = 0x07);
+constant!(/// LAN 硬體種類。
+PCAN_LAN: TPCANDevice = 0x08);
+
+constant!(/// 通道無法使用。
+PCAN_CHANNEL_UNAVAILABLE: u32 = 0x00);
+constant!(/// 通道可供連線。
+PCAN_CHANNEL_AVAILABLE: u32 = 0x01);
+constant!(/// 通道已由其他程式占用。
+PCAN_CHANNEL_OCCUPIED: u32 = 0x02);
+constant!(/// 通道可供連線且已由 PCAN-View 占用。
+PCAN_CHANNEL_PCANVIEW: u32 = PCAN_CHANNEL_AVAILABLE | PCAN_CHANNEL_OCCUPIED);
+
+constant!(/// 通道支援 CAN FD。
+FEATURE_FD_CAPABLE: u32 = 0x01);
+constant!(/// 通道支援幀間延遲設定。
+FEATURE_DELAY_CAPABLE: u32 = 0x02);
+constant!(/// 通道支援數位或類比 I/O。
+FEATURE_IO_CAPABLE: u32 = 0x04);
 
 constant!(/// 關閉布林參數。
 PCAN_PARAMETER_OFF: u32 = 0x00);
@@ -296,3 +345,24 @@ constant!(/// 古典 CAN 10 kbit/s BTR0BTR1。
 PCAN_BAUD_10K: TPCANBaudrate = 0x672f);
 constant!(/// 古典 CAN 5 kbit/s BTR0BTR1。
 PCAN_BAUD_5K: TPCANBaudrate = 0x7f7f);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parameter_values_match_vendor_header() {
+        // 值來自 PEAK 原廠 PCANBasic.h，曾因抄錯導致開啟時誤設唯讀參數，請勿再更動。
+        assert_eq!(PCAN_ACCEPTANCE_FILTER_11BIT, 0x22);
+        assert_eq!(PCAN_ACCEPTANCE_FILTER_29BIT, 0x23);
+        assert_eq!(PCAN_BITRATE_INFO, 0x18);
+        assert_eq!(PCAN_ALLOW_STATUS_FRAMES, 0x1e);
+        assert_eq!(PCAN_ALLOW_RTR_FRAMES, 0x1f);
+        assert_eq!(PCAN_ALLOW_ERROR_FRAMES, 0x20);
+        assert_eq!(PCAN_ALLOW_ECHO_FRAMES, 0x2c);
+        assert_eq!(PCAN_HARDWARE_NAME, 0x0e);
+        assert_eq!(PCAN_CHANNEL_FEATURES, 0x16);
+        assert_eq!(PCAN_ATTACHED_CHANNELS_COUNT, 0x2a);
+        assert_eq!(PCAN_ATTACHED_CHANNELS, 0x2b);
+    }
+}
