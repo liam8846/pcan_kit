@@ -2,6 +2,7 @@
 
 use core::num::NonZeroU32;
 use core::time::Duration;
+use std::sync::Arc;
 
 use pcan_core::testing::{FakeFactory, FakeTransportBuilder};
 use pcan_core::{CanId, Frame};
@@ -221,4 +222,72 @@ async fn full_tx_queue_counts_skip_and_emits_drop_event() {
         }
     }
     assert!(saw_drop);
+}
+
+/// 驗證並行更新幀與酬載不會使週期排程器異常結束。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_frame_and_payload_updates_keep_scheduler_alive() {
+    const ITERATIONS: usize = 10_000;
+
+    let (factory, _) = FakeFactory::new(FakeTransportBuilder::default());
+    let link = Link::builder(factory).health_check_interval(None).build();
+    link.wait_connected().await.expect("連線");
+    let mut events = link.events();
+    let id = CanId::standard(0x123).expect("ID");
+    let cyclic = Arc::new(
+        link.schedule_cyclic(CyclicConfig::new(
+            Frame::new(id, &[0; 8]).expect("初始幀"),
+            Duration::from_secs(60),
+        ))
+        .expect("排程"),
+    );
+
+    let payload_handle = Arc::clone(&cyclic);
+    let payload_task = tokio::spawn(async move {
+        for index in 0..ITERATIONS {
+            let _result = if index % 2 == 0 {
+                payload_handle.set_payload(&[1; 2])
+            } else {
+                payload_handle.set_payload(&[2; 8])
+            };
+            tokio::task::yield_now().await;
+        }
+    });
+    let frame_handle = Arc::clone(&cyclic);
+    let frame_task = tokio::spawn(async move {
+        for index in 0..ITERATIONS {
+            let next = if index == ITERATIONS / 2 {
+                Frame::remote(id, 8).expect("遠端幀")
+            } else if index % 2 == 0 {
+                Frame::new(id, &[3; 2]).expect("兩位元組幀")
+            } else {
+                Frame::new(id, &[4; 8]).expect("八位元組幀")
+            };
+            let _result = frame_handle.set_frame(next);
+            tokio::task::yield_now().await;
+        }
+    });
+
+    payload_task.await.expect("酬載更新 task");
+    frame_task.await.expect("幀更新 task");
+    Arc::try_unwrap(cyclic)
+        .expect("並行 task 應已釋放控制代碼")
+        .stop()
+        .await
+        .expect("排程器應處理完所有更新並確認停止");
+
+    let probe = link
+        .schedule_cyclic(CyclicConfig::new(
+            Frame::new(id, &[5; 2]).expect("探測幀"),
+            Duration::from_secs(60),
+        ))
+        .expect("排程器應仍可接受新項目");
+    probe.stop().await.expect("停止探測項目");
+
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, BusEvent::WorkerLost { worker: "cyclic" }),
+            "週期排程器不得因並行更新而異常結束"
+        );
+    }
 }
