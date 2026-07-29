@@ -31,10 +31,13 @@
 
 /// 執行期後端列舉。
 pub mod any;
+/// 跨後端 CAN 通道探索。
+pub mod discover;
 /// URI 解析與連線便捷函式。
 pub mod open;
 
 pub use any::{AnyFactory, AnyTransport};
+pub use discover::{ChannelInfo, list_channels};
 pub use open::{open, parse_uri};
 pub use pcan_core::{
     BackendError, Bitrate, BusState, BusStatus, BusWarnings, CanId, Capabilities, ConfigError,
@@ -51,6 +54,9 @@ pub use pcan_link::{
 };
 
 #[cfg(feature = "basic")]
-pub use pcan_basic::{PcanChannel, PcanChannelId, PcanConfig, PcanFactory, RxThreadPolicy};
+pub use pcan_basic::{
+    PcanChannel, PcanChannelCondition, PcanChannelFeatures, PcanChannelId, PcanChannelInfo,
+    PcanConfig, PcanDeviceKind, PcanFactory, RxThreadPolicy,
+};
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
-pub use pcan_socketcan::{CanSocket, SocketCanConfig, SocketCanFactory};
+pub use pcan_socketcan::{CanSocket, SocketCanConfig, SocketCanFactory, SocketCanInterfaceInfo};

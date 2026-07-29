@@ -21,7 +21,7 @@ use crate::config::{PcanConfig, classic_baudrate, fd_bitrate_string};
 use crate::convert::{frame_to_msg, frame_to_msg_fd};
 use crate::rx::RxSource;
 
-fn backend_error(
+pub(crate) fn backend_error(
     api: &PcanApi,
     code: u32,
     operation: &'static str,
@@ -70,7 +70,7 @@ fn cleanup(api: &PcanApi, handle: TPCANHandle) {
 }
 
 /// 將 PCAN 開啟工作本身的執行期故障轉為既有後端錯誤。
-fn open_task_error(text: impl Into<Box<str>>, operation: &'static str) -> Error {
+pub(crate) fn open_task_error(text: impl Into<Box<str>>, operation: &'static str) -> Error {
     Error::Io(BackendError::PcanBasic {
         code: 0,
         text: text.into(),

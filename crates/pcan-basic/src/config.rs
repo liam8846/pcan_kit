@@ -31,6 +31,25 @@ fn invalid_channel(value: impl Into<Box<str>>) -> ConfigError {
 }
 
 impl PcanChannelId {
+    /// 從 PCAN-Basic `TPCANHandle` 反查通道位址。
+    ///
+    /// handle 不屬於任何已知硬體種類時回傳 `None`。
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn from_handle(handle: TPCANHandle) -> Option<Self> {
+        match handle {
+            0x51..=0x58 => Some(Self::Usb((handle - 0x50) as u8)),
+            0x509..=0x510 => Some(Self::Usb((handle - 0x500) as u8)),
+            0x41..=0x48 => Some(Self::Pci((handle - 0x40) as u8)),
+            0x409..=0x410 => Some(Self::Pci((handle - 0x400) as u8)),
+            0x801..=0x810 => Some(Self::Lan((handle - 0x800) as u8)),
+            0x21..=0x28 => Some(Self::Isa((handle - 0x20) as u8)),
+            0x61..=0x62 => Some(Self::Pcc((handle - 0x60) as u8)),
+            0x31 => Some(Self::Dng(1)),
+            _ => None,
+        }
+    }
+
     /// 轉為 PCAN-Basic 的 `TPCANHandle`。
     ///
     /// # Errors
@@ -264,6 +283,27 @@ mod tests {
             PcanChannelId::parse("USB1").unwrap_or_else(|error| unreachable!("{error}")),
             PcanChannelId::Usb(1)
         );
+    }
+
+    #[test]
+    fn channel_handles_round_trip_and_reject_unknown_values() {
+        for channel in (1..=16)
+            .map(PcanChannelId::Usb)
+            .chain((1..=16).map(PcanChannelId::Pci))
+            .chain((1..=16).map(PcanChannelId::Lan))
+            .chain((1..=8).map(PcanChannelId::Isa))
+            .chain((1..=2).map(PcanChannelId::Pcc))
+            .chain(core::iter::once(PcanChannelId::Dng(1)))
+        {
+            let handle = channel
+                .to_handle()
+                .unwrap_or_else(|error| unreachable!("{error}"));
+            assert_eq!(PcanChannelId::from_handle(handle), Some(channel));
+        }
+
+        for handle in [0x00, 0x99, 0x600] {
+            assert_eq!(PcanChannelId::from_handle(handle), None);
+        }
     }
 
     #[test]

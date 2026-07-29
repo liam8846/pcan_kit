@@ -135,6 +135,47 @@ cargo run -p pcan-kit --example uds_request
 
 後三個範例使用 `FakeTransport`，沒有硬體也能執行。
 
+## 通道列舉
+
+`pcan_kit::list_channels()` 會非同步列出所有已編譯後端目前看得到的 CAN
+通道。每筆 `ChannelInfo` 都能提供可交給 `open()` 的 URI、人類可讀名稱、
+目前是否可開啟，以及硬體或介面是否具備 CAN FD 能力。
+
+單一後端不可用會被略過，不會讓整體列舉失敗。例如未安裝 PCAN-Basic
+驅動時，Linux 上仍可取得 SocketCAN 介面；所有後端都不可用或沒有硬體時，
+結果是空切片。若應用程式只呼叫較低階的 `pcan_basic::list_channels()`，
+舊版 PCAN-Basic 不支援 `PCAN_ATTACHED_CHANNELS` 時則會明確回傳
+`Error::Unsupported`。
+
+```rust,no_run
+use pcan_kit::list_channels;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let channels = list_channels().await?;
+    for channel in &channels {
+        println!(
+            "{}：{}（可用：{}，CAN FD：{}）",
+            channel.uri(),
+            channel.display_name(),
+            channel.is_available(),
+            channel.supports_fd(),
+        );
+    }
+
+    if channels.is_empty() {
+        println!("找不到 CAN 通道；請確認驅動與硬體");
+    }
+    Ok(())
+}
+```
+
+可直接執行完整範例：
+
+```bash
+cargo run -p pcan-kit --example list_channels
+```
+
 ## Features
 
 | feature | 預設 | 說明 |

@@ -16,6 +16,7 @@ default = ["tracing"]
 tracing = ["dep:tracing"]
 
 [dependencies]
+bitflags = { workspace = true }
 pcan-core = { workspace = true }
 pcan-basic-sys = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }

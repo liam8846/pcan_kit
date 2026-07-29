@@ -7,7 +7,8 @@ use libloading::Library;
 use pcan_core::LoadError;
 
 use crate::{
-    TPCANBaudrate, TPCANBitrateFD, TPCANHandle, TPCANMode, TPCANMsg, TPCANMsgFD, TPCANParameter,
+    PCAN_ATTACHED_CHANNELS, PCAN_ERROR_ILLPARAMVAL, PCAN_NONEBUS, TPCANBaudrate, TPCANBitrateFD,
+    TPCANChannelInformation, TPCANHandle, TPCANMode, TPCANMsg, TPCANMsgFD, TPCANParameter,
     TPCANStatus, TPCANTimestamp, TPCANTimestampFD, TPCANType,
 };
 
@@ -212,6 +213,31 @@ impl PcanApi {
             )
         };
         (status, value)
+    }
+
+    /// 以 `PCAN_ATTACHED_CHANNELS` 一次填滿呼叫端提供的通道資訊緩衝。
+    #[must_use]
+    pub fn attached_channels(&self, buffer: &mut [TPCANChannelInformation]) -> TPCANStatus {
+        if buffer.is_empty() {
+            return PCAN_ERROR_ILLPARAMVAL;
+        }
+        let Some(byte_len) = buffer
+            .len()
+            .checked_mul(core::mem::size_of::<TPCANChannelInformation>())
+            .and_then(|length| u32::try_from(length).ok())
+        else {
+            return PCAN_ERROR_ILLPARAMVAL;
+        };
+        // SAFETY: 緩衝已由呼叫端完整初始化，傳入 length 與實際位元組數
+        // 完全一致；驅動不保留該指標，且 `_lib` 在呼叫期間持續存活。
+        unsafe {
+            (self.get_value)(
+                PCAN_NONEBUS,
+                PCAN_ATTACHED_CHANNELS,
+                buffer.as_mut_ptr().cast(),
+                byte_len,
+            )
+        }
     }
 
     /// 設定 `u32` 型 PCAN 參數。

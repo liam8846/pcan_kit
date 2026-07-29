@@ -14,7 +14,13 @@ mod channel;
 pub mod config;
 /// PCAN C 訊息與核心幀之間的純函式轉換。
 pub mod convert;
+/// 已連接 PCAN 通道的列舉介面與資訊型別。
+pub mod enumerate;
 mod rx;
 
 pub use channel::{PcanChannel, PcanFactory};
 pub use config::{PcanChannelId, PcanConfig, RxThreadPolicy};
+pub use enumerate::{
+    PcanChannelCondition, PcanChannelFeatures, PcanChannelInfo, PcanDeviceKind, list_channels,
+    list_channels_from,
+};

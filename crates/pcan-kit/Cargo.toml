@@ -15,7 +15,12 @@ workspace = true
 default = ["basic", "socketcan", "tracing"]
 basic = ["dep:pcan-basic"]
 socketcan = ["dep:pcan-socketcan"]
-tracing = ["pcan-link/tracing"]
+tracing = [
+    "dep:tracing",
+    "pcan-link/tracing",
+    "pcan-basic?/tracing",
+    "pcan-socketcan?/tracing",
+]
 serde = ["pcan-core/serde"]
 test-util = ["pcan-core/test-util"]
 vcan-tests = ["socketcan"]
@@ -24,6 +29,7 @@ vcan-tests = ["socketcan"]
 pcan-core = { workspace = true }
 pcan-link = { workspace = true }
 pcan-basic = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pcan-socketcan = { workspace = true, optional = true }

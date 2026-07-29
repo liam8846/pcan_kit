@@ -16,5 +16,5 @@ pub mod types;
 pub use api::{PcanApi, load, load_from};
 pub use consts::*;
 pub use status::{StatusOutcome, bus_state_of, classify, warnings_of};
-pub use structs::{TPCANMsg, TPCANMsgFD, TPCANTimestamp};
+pub use structs::{TPCANChannelInformation, TPCANMsg, TPCANMsgFD, TPCANTimestamp};
 pub use types::*;

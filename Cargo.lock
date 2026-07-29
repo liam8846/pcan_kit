@@ -81,6 +81,7 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "pcan-basic"
 version = "0.2.1"
 dependencies = [
+ "bitflags",
  "libc",
  "pcan-basic-sys",
  "pcan-core",
@@ -118,6 +119,7 @@ dependencies = [
  "pcan-link",
  "pcan-socketcan",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
