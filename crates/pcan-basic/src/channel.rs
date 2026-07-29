@@ -340,7 +340,8 @@ impl Transport for PcanChannel {
 pub struct PcanFactory {
     config: PcanConfig,
     api: Arc<PcanApi>,
-    describe: String,
+    /// 以 `Arc<str>` 保存，使 `open()` 為 `spawn_blocking` 複製工廠時不需重新配置。
+    describe: Arc<str>,
     /// 序列化開啟嘗試，避免逾時遺棄的開啟與後續重試互相破壞。
     open_gate: Arc<Semaphore>,
 }
@@ -383,11 +384,12 @@ impl PcanFactory {
             Some(path) => load_from(path)?,
             None => load()?,
         };
-        let describe = format!(
+        let describe: Arc<str> = format!(
             "pcan:{}@{}",
             config.channel,
             config.common.bitrate.nominal()
-        );
+        )
+        .into();
         Ok(Self {
             config,
             api,
