@@ -208,7 +208,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: 安裝功能組合檢查工具
         if: steps.gate.outputs.run == 'true'
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.4
         with:
           tool: cargo-hack
       - name: 快取功能組合建置資料
