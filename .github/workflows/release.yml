@@ -95,7 +95,7 @@ jobs:
           sha256sum pcan-kit-*.tar.gz pcan-kit-*.zip > SHA256SUMS
 
       - name: 建立發行版本
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             release/pcan-kit-*.tar.gz
