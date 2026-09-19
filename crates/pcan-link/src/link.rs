@@ -340,7 +340,7 @@ impl Link {
             return Err(Error::Unsupported("週期必須大於零"));
         }
         let id = CyclicId(self.inner.cyclic_next.fetch_add(1, Ordering::Relaxed));
-        let (pending, stats) = new_shared(config.frame);
+        let (pending, stats) = new_shared(&config);
         self.inner
             .channels
             .cyclic

@@ -231,6 +231,78 @@ async fn rapid_payload_updates_coalesce_to_the_latest_value() {
     assert_eq!(sent[0].data(), &[UPDATES], "合併後必須套用最後一次更新的值");
 }
 
+/// 高頻同步控制呼叫必須合併，而不是在控制通道裡無限堆積。
+///
+/// 控制通道不能改成 bounded：`Drop` 也要用它送停止命令，而 `Drop` 不能
+/// `.await`。上界因此只能來自「每個項目最多一個未處理命令」的合併設計本身。
+///
+/// 本測試在 current-thread runtime 上做二十萬輪、共一百萬次控制呼叫，中途完全
+/// 不讓排程器有機會執行。若任何一個控制方法仍是「一次呼叫排一個命令」，佇列
+/// 就會累積到一百萬筆；合併之後，最終只剩一個命令、一份最新狀態，以及受
+/// `max_burst` 封頂的觸發計數。
+#[tokio::test(start_paused = true)]
+async fn rapid_control_calls_coalesce_instead_of_growing_the_queue() {
+    const ROUNDS: u32 = 200_000;
+    let trigger_cap = NonZeroU32::new(8).expect("非零");
+
+    let (factory, handle) = FakeFactory::new(FakeTransportBuilder::default());
+    let link = Link::builder(factory)
+        .tx_queue_capacity(256)
+        .health_check_interval(None)
+        .build();
+    link.wait_connected().await.expect("連線");
+    let cyclic = link
+        .schedule_cyclic(
+            CyclicConfig::new(frame(0), Duration::from_secs(3600)).with_max_burst(trigger_cap),
+        )
+        .expect("排程");
+    settle().await;
+
+    for round in 0..ROUNDS {
+        let payload = u8::try_from(round % 251).expect("餘數必定可表示為 u8");
+        cyclic.trigger_once().expect("觸發");
+        cyclic.set_payload(&[payload]).expect("更新酬載");
+        cyclic
+            .set_period(Duration::from_secs(3600 + u64::from(round % 97)))
+            .expect("改週期");
+        cyclic.resume().expect("恢復");
+        // 每輪以暫停收尾：合併後的最終狀態是暫停，排程器因而不會在斷言前
+        // 因為時間自動前進而多送出週期幀，觸發送出的數量才能精確斷言。
+        cyclic.pause().expect("暫停");
+    }
+    settle().await;
+
+    let sent = handle.sent();
+    assert_eq!(
+        sent.len(),
+        trigger_cap.get() as usize,
+        "未處理觸發必須封頂於 max_burst，實際送出 {} 幀",
+        sent.len()
+    );
+    let last_payload = u8::try_from((ROUNDS - 1) % 251).expect("餘數必定可表示為 u8");
+    for frame in &sent {
+        assert_eq!(
+            frame.data(),
+            &[last_payload],
+            "觸發必須送出合併後的最新酬載"
+        );
+    }
+
+    let stats = cyclic.stats();
+    assert_eq!(stats.sent, u64::from(trigger_cap.get()));
+    assert_eq!(
+        stats.skipped,
+        u64::from(ROUNDS) - u64::from(trigger_cap.get()),
+        "超出上限的觸發必須全部計入 skipped，不得靜默消失"
+    );
+
+    // 排空之後仍必須正常運作：合併是流量控制，不是一次性的關閉。
+    cyclic.resume().expect("恢復");
+    cyclic.trigger_once().expect("觸發");
+    settle().await;
+    assert_eq!(handle.sent().len(), sent.len() + 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn drop_stop_survives_more_than_old_control_capacity() {
     let (factory, handle) = FakeFactory::new(FakeTransportBuilder::default());
