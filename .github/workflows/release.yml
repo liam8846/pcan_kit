@@ -80,6 +80,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: 取出完整版本歷史
+        # git-cliff 需要完整歷史與所有標籤才能界定「這個版本包含哪些 commit」；
+        # 淺層 clone 會讓它把整段歷史都算進本次發行。
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
       - name: 下載所有平台發行檔
         uses: actions/download-artifact@v8
         with:
@@ -94,6 +101,32 @@ jobs:
           cd release
           sha256sum pcan-kit-*.tar.gz pcan-kit-*.zip > SHA256SUMS
 
+      - name: 安裝變更紀錄產生器
+        uses: taiki-e/install-action@v2.87.1
+        with:
+          tool: git-cliff
+
+      - name: 產生本次發行說明
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # --current 只取 HEAD 所在標籤的區段；--strip header 去掉整份檔案的
+          # 前言，發行頁面不需要它。
+          git cliff --config cliff.toml --current --strip header --output release-notes.md
+          cat >> release-notes.md <<'REQUIREMENTS'
+
+          ## 執行需求
+
+          這些執行檔採**執行期動態載入** PCAN-Basic 函式庫，因此**編譯時不需要 PEAK SDK**。
+
+          在**沒有安裝 PEAK 驅動**的機器上執行，程式會回報 `LoadError::NotFound` 並列出嘗試過的路徑後正常結束——**這是預期行為，不是程式壞掉**。
+
+          - Windows：安裝 PEAK 的 PCAN 驅動，或設定環境變數 `PCAN_BASIC_LIB` 指向 `PCANBasic.dll`
+          - Linux（PCAN-Basic）：安裝 PEAK 的 `libpcanbasic.so`
+          - Linux（SocketCAN）：不需要 PEAK 函式庫，用 `sudo ip link set can0 up type can bitrate 500000` 設定介面即可
+          REQUIREMENTS
+          cat release-notes.md
+
       - name: 建立發行版本
         uses: softprops/action-gh-release@v3
         with:
@@ -101,14 +134,59 @@ jobs:
             release/pcan-kit-*.tar.gz
             release/pcan-kit-*.zip
             release/SHA256SUMS
-          generate_release_notes: true
-          body: |
-            ## 執行需求
+          # 發行說明改由 git-cliff 依 conventional commits 分類產生，
+          # 不再使用 GitHub 的 generate_release_notes（只會平鋪 PR 標題）。
+          body_path: release-notes.md
 
-            這些執行檔採**執行期動態載入** PCAN-Basic 函式庫，因此**編譯時不需要 PEAK SDK**。
+  changelog:
+    name: 回寫變更紀錄至預設分支
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # 推不上去（例如分支保護擋住）時，已經成功的發行不該因此變成失敗。
+    continue-on-error: true
+    permissions:
+      contents: write
+    steps:
+      - name: 取出預設分支完整歷史
+        uses: actions/checkout@v7
+        with:
+          ref: master
+          fetch-depth: 0
 
-            在**沒有安裝 PEAK 驅動**的機器上執行，程式會回報 `LoadError::NotFound` 並列出嘗試過的路徑後正常結束——**這是預期行為，不是程式壞掉**。
+      - name: 確認本次標籤在預設分支上
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 從非 master 的分支打標籤時，把 changelog 推回 master 會寫進尚未
+          # 合併的內容。這種情況直接略過，由合併後的發行負責更新。
+          if git merge-base --is-ancestor "$GITHUB_SHA" HEAD; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "標籤 ${GITHUB_REF_NAME} 不在 master 上，略過回寫"
+          fi
 
-            - Windows：安裝 PEAK 的 PCAN 驅動，或設定環境變數 `PCAN_BASIC_LIB` 指向 `PCANBasic.dll`
-            - Linux（PCAN-Basic）：安裝 PEAK 的 `libpcanbasic.so`
-            - Linux（SocketCAN）：不需要 PEAK 函式庫，用 `sudo ip link set can0 up type can bitrate 500000` 設定介面即可
+      - name: 安裝變更紀錄產生器
+        if: steps.gate.outputs.run == 'true'
+        uses: taiki-e/install-action@v2.87.1
+        with:
+          tool: git-cliff
+
+      - name: 重新產生並提交變更紀錄
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git cliff --config cliff.toml --output CHANGELOG.md
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "變更紀錄已是最新，無須提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          # [skip ci] 避免這個純文件提交再觸發一次完整 CI。
+          git commit -m "chore: 更新變更紀錄至 ${GITHUB_REF_NAME} [skip ci]"
+          git push origin HEAD:master
