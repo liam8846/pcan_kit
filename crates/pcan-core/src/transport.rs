@@ -5,25 +5,30 @@ use crate::filter::FilterSet;
 use crate::frame::{Frame, RxFrame};
 use crate::status::BusStatus;
 
-/// 後端在執行期實際可用的能力。
+/// 這個已開啟的後端**具備**哪些能力。
 ///
-/// crate 在編譯期永遠能表示 CAN FD 幀；個別裝置是否能使用則由本結構協商。
-/// 各欄位描述後端具備的能力，而非目前是否啟用該功能。例如即使
-/// `receive_error_frames` 設為 `false`，只要後端支援錯誤幀，
-/// [`error_frames`](Self::error_frames) 仍為 `true`。
+/// 本結構只描述「做不做得到」，不描述「這次有沒有開」。例如即使
+/// [`TransportConfig::receive_error_frames`](crate::TransportConfig::receive_error_frames)
+/// 設為 `false`，只要後端支援錯誤幀，[`error_frames`](Self::error_frames)
+/// 仍為 `true`。要知道本次開啟實際啟用了什麼，請查
+/// [`ActiveFeatures`]。
+///
+/// 能力資訊共有三層，用途各不相同：
+///
+/// | 層 | 型別 | 回答的問題 |
+/// |---|---|---|
+/// | 硬體 | `ChannelInfo`（列舉 API，開啟前） | 這個裝置本身支援什麼 |
+/// | 後端 | [`Capabilities`] | 已開啟的傳輸層做得到什麼 |
+/// | 本次 | [`ActiveFeatures`] | 這次開啟實際啟用了什麼 |
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[non_exhaustive]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Capabilities {
-    /// 是否支援 CAN FD。
+    /// 後端是否具備 CAN FD 能力。
     pub can_fd: bool,
-    /// 是否支援 CAN FD 位元率切換。
+    /// 後端是否具備 CAN FD 位元率切換能力。
     pub brs: bool,
-    /// 是否能接收本地送出幀的回音。
-    ///
-    /// 此欄位目前有已知語意落差：`pcan-basic` 回報後端能力，
-    /// `pcan-socketcan` 則回報使用者是否啟用；後續將另案統一，本次不改變
-    /// 既有行為。
+    /// 後端是否具備接收本地送出幀回音的能力。
     pub echo_frames: bool,
     /// 後端是否具備接收錯誤幀的能力。
     pub error_frames: bool,
@@ -38,6 +43,31 @@ pub struct Capabilities {
     /// 是否提供硬體時間戳。
     pub hardware_timestamps: bool,
     /// 是否支援唯聽模式。
+    pub listen_only: bool,
+}
+
+/// 這次開啟**實際啟用**了哪些功能。
+///
+/// 與 [`Capabilities`] 成對：前者回答「做不做得到」，本結構回答「這次有沒
+/// 有開」。兩者可以合法地不同——以古典位元率開啟一張支援 FD 的卡片時，
+/// `Capabilities::can_fd` 為 `true` 而 [`can_fd`](Self::can_fd) 為 `false`。
+///
+/// 把兩件事擠進同一個 `bool` 會讓跨後端的語意無法對齊，因此明確分開。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[non_exhaustive]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ActiveFeatures {
+    /// 本次是否以 CAN FD 模式開啟。
+    pub can_fd: bool,
+    /// 本次是否可使用位元率切換。
+    pub brs: bool,
+    /// 本次是否會收到本地送出幀的回音。
+    pub echo_frames: bool,
+    /// 本次是否會收到錯誤幀。
+    pub error_frames: bool,
+    /// 本次是否會收到狀態幀。
+    pub status_frames: bool,
+    /// 本次是否以唯聽模式開啟。
     pub listen_only: bool,
 }
 
@@ -73,6 +103,11 @@ pub trait Transport: Send + Sync + 'static {
     ///
     /// 佇列滿時後端應先退避重試，超過上限才回傳 [`crate::Error::TxQueueFull`]。
     fn send(&self, frame: &Frame) -> impl Future<Output = Result<()>> + Send;
+
+    /// 回報本次開啟實際啟用了哪些功能。
+    ///
+    /// 與 [`capabilities`](Self::capabilities) 的差別見 [`ActiveFeatures`]。
+    fn active_features(&self) -> ActiveFeatures;
 
     /// 查詢當前匯流排狀態，供健康檢查使用。
     fn status(&self) -> impl Future<Output = Result<BusStatus>> + Send;

@@ -37,4 +37,4 @@ pub use frame::{
 pub use id::{CanId, EXT_FLAG};
 pub use stats::{Stats, StatsSnapshot};
 pub use status::{BusState, BusStatus, BusWarnings, ErrorCounters};
-pub use transport::{Capabilities, Transport, TransportEvent, TransportFactory};
+pub use transport::{ActiveFeatures, Capabilities, Transport, TransportEvent, TransportFactory};

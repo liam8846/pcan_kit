@@ -13,8 +13,8 @@ use core::time::Duration;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pcan_core::{
-    BusState, BusStatus, BusWarnings, Capabilities, Error, FaultKind, FilterSet, Stats, Transport,
-    TransportEvent, TransportFactory,
+    ActiveFeatures, BusState, BusStatus, BusWarnings, Capabilities, Error, FaultKind, FilterSet,
+    Stats, Transport, TransportEvent, TransportFactory,
 };
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -72,7 +72,11 @@ pub(crate) struct SharedRuntime {
     pub(crate) events: broadcast::Sender<BusEvent>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) bus_status: Arc<Mutex<BusStatus>>,
-    pub(crate) capabilities: Arc<Mutex<Option<Capabilities>>>,
+    /// 已開啟傳輸層的後端能力與本次啟用功能。
+    ///
+    /// 兩者放在同一個鎖裡一起換，讀者不會看到「能力已更新、啟用狀態還是
+    /// 舊的」這種撕裂組合。
+    pub(crate) capabilities: Arc<Mutex<Option<(Capabilities, ActiveFeatures)>>>,
     pub(crate) in_flight: Arc<AtomicUsize>,
     pub(crate) tx_staged: Arc<AtomicUsize>,
     pub(crate) tx_high_water: Arc<AtomicBool>,
@@ -114,7 +118,8 @@ async fn apply_input<F: TransportFactory>(
                                 followup = Some(LinkInput::OpenFailed(error.fault_kind()));
                                 continue;
                             }
-                            *lock(&context.shared.capabilities) = Some(opened.capabilities());
+                            *lock(&context.shared.capabilities) =
+                                Some((opened.capabilities(), opened.active_features()));
                             *context.transport = Some(Arc::clone(&opened));
                             let _changed = context.transport_watch.send(Some(opened));
                             followup = Some(LinkInput::OpenSucceeded);

@@ -65,17 +65,17 @@ impl fmt::Debug for Matcher {
 impl Matcher {
     pub(crate) fn evaluate(&self, frame: &RxFrame) -> MatchResult {
         match self {
-            Self::Id(id) if frame.frame.id() == *id => MatchResult::AcceptAndFinish,
+            Self::Id(id) if frame.frame.id() == *id => MatchResult::Accept,
             Self::IdMask { id, mask }
                 if ((frame.frame.id().to_bits() ^ *id) & (*mask & (EXT_FLAG | 0x1fff_ffff)))
                     == 0 =>
             {
-                MatchResult::AcceptAndFinish
+                MatchResult::Accept
             }
             Self::IdAndPrefix { id, prefix }
                 if frame.frame.id() == *id && prefix.matches(frame.frame.data()) =>
             {
-                MatchResult::AcceptAndFinish
+                MatchResult::Accept
             }
             Self::Custom(predicate) => predicate(frame),
             _ => MatchResult::NoMatch,
@@ -150,15 +150,17 @@ impl PrefixPattern {
 }
 
 /// 自訂述詞的比對結果。
+///
+/// 比對器只負責「這一幀屬不屬於本交易」，**不**決定交易何時結束；結束
+/// 完全由 [`CollectMode`] 決定。這是刻意的責任分離：同一個比對器能配
+/// `First`、`Exactly(n)` 或 `Window(d)` 使用，語意不變。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
 pub enum MatchResult {
     /// 不屬於此交易。
     NoMatch,
-    /// 收下幀但交易尚未結束。
+    /// 收下這一幀；是否完成交易由 [`CollectMode`] 決定。
     Accept,
-    /// 收下幀並允許完成交易。
-    AcceptAndFinish,
     /// 明確拒絕並以錯誤結束。
     Reject(RejectReason),
 }
@@ -437,9 +439,7 @@ impl TransactionTable {
         self.slots.retain_mut(|slot| {
             let signal = match slot.matcher.evaluate(&frame) {
                 MatchResult::NoMatch => return true,
-                MatchResult::Accept | MatchResult::AcceptAndFinish => {
-                    TransactionSignal::Frame(frame)
-                }
+                MatchResult::Accept => TransactionSignal::Frame(frame),
                 MatchResult::Reject(reason) => TransactionSignal::Rejected(reason),
             };
             match slot.sender.try_send(signal) {

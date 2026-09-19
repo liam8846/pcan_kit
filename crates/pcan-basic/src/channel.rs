@@ -12,8 +12,8 @@ use pcan_basic_sys::{
     load_from, warnings_of,
 };
 use pcan_core::{
-    BackendError, Bitrate, BusStatus, Capabilities, Error, FaultKind, FilterSet, Frame, Transport,
-    TransportEvent, TransportFactory,
+    ActiveFeatures, BackendError, Bitrate, BusStatus, Capabilities, Error, FaultKind, FilterSet,
+    Frame, Transport, TransportEvent, TransportFactory,
 };
 use tokio::sync::{Mutex, Semaphore};
 
@@ -157,6 +157,7 @@ pub struct PcanChannel {
     rx: RxSource,
     handle: TPCANHandle,
     caps: Capabilities,
+    active: ActiveFeatures,
     fd_mode: bool,
     tx_lock: Mutex<()>,
     /// 保護 FFI 生命週期：所有針對 `handle` 的同步 PCAN 呼叫都必須在此閘門
@@ -173,6 +174,7 @@ impl core::fmt::Debug for PcanChannel {
             .debug_struct("PcanChannel")
             .field("handle", &self.handle)
             .field("caps", &self.caps)
+            .field("active", &self.active)
             .field("fd_mode", &self.fd_mode)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -367,6 +369,10 @@ impl Transport for PcanChannel {
 
     fn capabilities(&self) -> Capabilities {
         self.caps
+    }
+
+    fn active_features(&self) -> ActiveFeatures {
+        self.active
     }
 }
 
@@ -563,8 +569,10 @@ impl PcanFactory {
             return Err(error);
         }
         let mut caps = Capabilities::default();
-        caps.can_fd = fd_mode;
-        caps.brs = fd_mode;
+        // 後端能力，與本次如何開啟無關：載入的 PCAN-Basic 是否提供完整 FD
+        // API，決定這個後端做不做得到 FD，而不是這次有沒有用 FD。
+        caps.can_fd = self.api.supports_fd();
+        caps.brs = self.api.supports_fd();
         caps.echo_frames = echo_frames;
         // PCAN_ALLOW_ERROR_FRAMES 與 PCAN_ALLOW_STATUS_FRAMES 已由上方必要參數迴圈以 required_status 驗證；抵達此處代表驅動已接受兩者。
         caps.error_frames = true;
@@ -572,10 +580,19 @@ impl PcanFactory {
         caps.hardware_filter = true;
         caps.hardware_timestamps = true;
         caps.listen_only = true;
+        // 本次實際啟用的功能，全部取自這次開啟用的設定。
+        let mut active = ActiveFeatures::default();
+        active.can_fd = fd_mode;
+        active.brs = fd_mode;
+        active.echo_frames = echo_frames && self.config.common.receive_own_frames;
+        active.error_frames = self.config.common.receive_error_frames;
+        active.status_frames = self.config.common.receive_status_frames;
+        active.listen_only = self.config.common.listen_only;
         Ok(PcanChannel {
             rx,
             handle,
             caps,
+            active,
             fd_mode,
             tx_lock: Mutex::new(()),
             ffi_gate: std::sync::Mutex::new(()),

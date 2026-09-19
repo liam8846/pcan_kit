@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use pcan_core::{
-    BackendError, Bitrate, BusStatus, CanId, Capabilities, ConfigError, Error, FaultKind,
-    FilterSet, Frame, FrameFlags, RxFrame, Timestamp, TimestampSource, Transport, TransportConfig,
-    TransportEvent, TransportFactory, len_to_dlc,
+    ActiveFeatures, BackendError, Bitrate, BusStatus, CanId, Capabilities, ConfigError, Error,
+    FaultKind, FilterSet, Frame, FrameFlags, RxFrame, Timestamp, TimestampSource, Transport,
+    TransportConfig, TransportEvent, TransportFactory, len_to_dlc,
 };
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
@@ -304,6 +304,13 @@ fn control_timestamp(header: &libc::msghdr) -> Option<Timestamp> {
 pub struct CanSocket {
     io: AsyncFd<OwnedFd>,
     caps: Capabilities,
+    active: ActiveFeatures,
+    /// 這個 socket 是否真的啟用了 `CAN_RAW_FD_FRAMES`。
+    ///
+    /// 送出閘門刻意用這個私有欄位而不是 `caps.can_fd`：`Capabilities` 是
+    /// 「後端做得到什麼」的公開契約，把執行期的拒絕條件綁在它上面，日後
+    /// 任何契約調整都會無聲地改變哪些幀送得出去。
+    fd_enabled: bool,
     kernel_timestamps: bool,
     closed: AtomicBool,
     /// 關閉信號的發送端；`close()` 以此喚醒所有停在 I/O 就緒上的操作。
@@ -329,6 +336,7 @@ impl core::fmt::Debug for CanSocket {
             .debug_struct("CanSocket")
             .field("fd", &self.io.get_ref().as_raw_fd())
             .field("caps", &self.caps)
+            .field("active", &self.active)
             .field("kernel_timestamps", &self.kernel_timestamps)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -468,20 +476,34 @@ impl CanSocket {
         let io = AsyncFd::new(owned)
             .map_err(|source| socket_error("AsyncFd::new(SocketCAN)", FaultKind::Fatal, source))?;
         let mut caps = Capabilities::default();
+        // fd_enabled 來自無條件的 CAN_RAW_FD_FRAMES 探測，與使用者是否要求
+        // FD 無關，因此它回答的正是「這個核心與介面做不做得到 FD」。
         caps.can_fd = fd_enabled;
         caps.brs = fd_enabled;
-        caps.echo_frames = config.common.receive_own_frames;
+        // CAN_RAW_RECV_OWN_MSGS 設定失敗會中止開啟流程，抵達此處即代表核心
+        // 具備回音能力；本次有沒有開由 ActiveFeatures 回報。
+        caps.echo_frames = true;
         // CAN_RAW_ERR_FILTER 必須設定成功才會繼續開啟流程，因此後端確實具備此能力。
         caps.error_frames = true;
         // SocketCAN 以錯誤幀推導匯流排狀態，沒有可獨立接收的狀態幀。
         caps.status_frames = false;
         caps.hardware_filter = true;
         caps.hardware_timestamps = false;
+        // 唯聽必須由 ip link 在介面層設定，開啟流程已在最前面拒絕該請求。
         caps.listen_only = false;
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let mut active = ActiveFeatures::default();
+        active.can_fd = fd_enabled;
+        active.brs = fd_enabled;
+        active.echo_frames = config.common.receive_own_frames;
+        active.error_frames = config.common.receive_error_frames;
+        active.status_frames = false;
+        active.listen_only = false;
         Ok(Self {
             io,
             caps,
+            active,
+            fd_enabled,
             kernel_timestamps,
             closed: AtomicBool::new(false),
             shutdown,
@@ -681,7 +703,7 @@ impl Transport for CanSocket {
             if self.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed);
             }
-            if frame.is_fd() && !self.caps.can_fd {
+            if frame.is_fd() && !self.fd_enabled {
                 return Err(Error::Unsupported("此 SocketCAN socket 未啟用 CAN FD"));
             }
             loop {
@@ -759,6 +781,10 @@ impl Transport for CanSocket {
 
     fn capabilities(&self) -> Capabilities {
         self.caps
+    }
+
+    fn active_features(&self) -> ActiveFeatures {
+        self.active
     }
 }
 

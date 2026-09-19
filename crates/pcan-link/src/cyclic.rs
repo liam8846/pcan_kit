@@ -1,9 +1,9 @@
 use core::cmp::Reverse;
 use core::num::NonZeroU32;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::collections::BinaryHeap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use pcan_core::{Error, Frame, Stats};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -54,11 +54,24 @@ pub struct CyclicConfig {
     pub repeat: Repeat,
     /// 落後政策。
     pub overrun: OverrunPolicy,
+    /// 單一 tick 最多補送幾次；只在 [`OverrunPolicy::Burst`] 下生效。
+    ///
+    /// 為排程器延遲設下確定性上界。沒有上限時，1 ms 週期的項目在 runtime
+    /// 停頓 30 秒後會在單一 tick 裡跑 30000 次補送迴圈，期間 `Stop`、
+    /// `Pause`、`SetPayload`、`SetPeriod`、`Trigger` 等控制命令全部無法被
+    /// 處理；佇列早已滿時這些補送也只是快速失敗，毫無產出。
+    ///
+    /// CAN 控制幀通常越舊越沒有價值——停頓五秒後補完過去五百個 heartbeat
+    /// 並不是使用者要的行為。超出上限的 tick 計入 [`CyclicStats::skipped`]。
+    pub max_burst: NonZeroU32,
     /// 同一 tick 的順序，數值小者優先。
     pub priority: u8,
 }
 
 impl CyclicConfig {
+    /// [`max_burst`](Self::max_burst) 的預設值。
+    pub const DEFAULT_MAX_BURST: NonZeroU32 = NonZeroU32::new(32).unwrap();
+
     /// 建立永久重複的週期設定。
     #[must_use]
     pub const fn new(frame: Frame, period: Duration) -> Self {
@@ -68,6 +81,7 @@ impl CyclicConfig {
             initial_delay: None,
             repeat: Repeat::Forever,
             overrun: OverrunPolicy::Skip,
+            max_burst: Self::DEFAULT_MAX_BURST,
             priority: 128,
         }
     }
@@ -93,6 +107,13 @@ impl CyclicConfig {
         self
     }
 
+    /// 設定單一 tick 的最大補送次數。
+    #[must_use]
+    pub const fn with_max_burst(mut self, max_burst: NonZeroU32) -> Self {
+        self.max_burst = max_burst;
+        self
+    }
+
     /// 設定同 tick 優先順序。
     #[must_use]
     pub const fn with_priority(mut self, priority: u8) -> Self {
@@ -109,8 +130,58 @@ pub struct CyclicStats {
     pub sent: u64,
     /// 因斷線、落後或佇列壓力跳過的次數。
     pub skipped: u64,
-    /// 因併發改幀導致長度不符而被忽略的酬載更新次數。
+    /// 因長度不符而被拒絕的 [`CyclicHandle::set_payload`] 次數。
+    ///
+    /// 合併更新槽讓長度檢查與套用在同一個鎖內完成，不再有「送出命令後排程
+    /// 器才發現幀已變短」的競態；此計數改在呼叫端即時累加，記錄的事件相同
+    /// 但更早被偵測到。
     pub stale_payloads: u64,
+}
+
+fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+    value
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 週期項目「最新期望狀態」的共享槽。
+///
+/// [`CyclicHandle::set_payload`] 與 [`CyclicHandle::set_frame`] 是同步函式，
+/// 可以被極高速呼叫。若每次呼叫都排一個命令，控制通道就會無限成長——該
+/// 通道必須是 unbounded，因為 `Drop` 也要用它送清理命令，而 `Drop` 不能
+/// `.await`——排程器還得逐一套用其實早已被覆蓋的中間值。
+///
+/// 改為在此保存最新值、並以 `queued` 合併喚醒命令之後，一百萬次
+/// `set_payload` 最多只留一個未處理命令，排程器也只會看到最後一個值。週期
+/// 傳送本來就只關心「下一次要送什麼」，中間值沒有保留價值。
+#[derive(Debug)]
+pub(crate) struct PendingUpdate {
+    frame: Mutex<Frame>,
+    queued: AtomicBool,
+}
+
+impl PendingUpdate {
+    fn new(frame: Frame) -> Self {
+        Self {
+            frame: Mutex::new(frame),
+            queued: AtomicBool::new(false),
+        }
+    }
+
+    /// 就地套用等長酬載；長度不符時回傳 `false` 且不留下部分更新。
+    fn apply_payload(&self, data: &[u8]) -> bool {
+        let mut frame = lock(&self.frame);
+        if frame.data().len() != data.len() {
+            return false;
+        }
+        frame.data_mut().copy_from_slice(data);
+        true
+    }
+
+    /// 取得目前期望送出的幀。
+    fn frame(&self) -> Frame {
+        *lock(&self.frame)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -134,7 +205,7 @@ pub struct CyclicHandle {
     id: CyclicId,
     control: mpsc::UnboundedSender<CyclicCommand>,
     detached: bool,
-    payload_len: Arc<AtomicUsize>,
+    pending: Arc<PendingUpdate>,
     stats: Arc<SharedStats>,
 }
 
@@ -151,22 +222,31 @@ impl CyclicHandle {
     ///
     /// 長度不同或排程器已關閉時回傳錯誤。
     pub fn set_payload(&self, data: &[u8]) -> Result<(), Error> {
-        if data.len() != self.payload_len.load(Ordering::Acquire) {
+        if !self.pending.apply_payload(data) {
+            self.stats.stale_payloads.fetch_add(1, Ordering::Relaxed);
             return Err(Error::Unsupported("週期幀新舊酬載長度必須相同"));
         }
-        let mut payload = [0; 64];
-        let len = u8::try_from(data.len())
-            .ok()
-            .filter(|value| usize::from(*value) <= payload.len())
-            .ok_or(Error::Unsupported("週期幀酬載長度超過 64"))?;
-        payload[..data.len()].copy_from_slice(data);
-        self.control
-            .send(CyclicCommand::SetPayload {
-                id: self.id,
-                payload,
-                len,
-            })
-            .map_err(|_| Error::Closed)
+        self.wake()
+    }
+
+    /// 排一個合併更新命令；已有命令在排隊時不重複送。
+    ///
+    /// 呼叫端先寫值再設旗標，排程器先清旗標再讀值。這個配對保證不會出現
+    /// 「旗標已清、但新值沒有命令護送」的組合：任何在排程器清旗標之後寫入
+    /// 的值，其 `swap` 必定看到 `false`，因而會再排到一個命令。
+    fn wake(&self) -> Result<(), Error> {
+        if self.pending.queued.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        if self
+            .control
+            .send(CyclicCommand::ApplyUpdate { id: self.id })
+            .is_err()
+        {
+            self.pending.queued.store(false, Ordering::Release);
+            return Err(Error::Closed);
+        }
+        Ok(())
     }
 
     /// 更新後續送出的完整幀。
@@ -175,12 +255,8 @@ impl CyclicHandle {
     ///
     /// 排程器已關閉時回傳錯誤。
     pub fn set_frame(&self, frame: Frame) -> Result<(), Error> {
-        self.control
-            .send(CyclicCommand::SetFrame { id: self.id, frame })
-            .map_err(|_| Error::Closed)?;
-        self.payload_len
-            .store(frame.data().len(), Ordering::Release);
-        Ok(())
+        *lock(&self.pending.frame) = frame;
+        self.wake()
     }
 
     /// 更新週期並由目前時間重新排定。
@@ -285,17 +361,12 @@ pub(crate) enum CyclicCommand {
     Add {
         id: CyclicId,
         config: CyclicConfig,
-        payload_len: Arc<AtomicUsize>,
+        pending: Arc<PendingUpdate>,
         stats: Arc<SharedStats>,
     },
-    SetPayload {
+    /// 合併後的酬載／整幀更新；實際新值由共享槽讀取。
+    ApplyUpdate {
         id: CyclicId,
-        payload: [u8; 64],
-        len: u8,
-    },
-    SetFrame {
-        id: CyclicId,
-        frame: Frame,
     },
     SetPeriod {
         id: CyclicId,
@@ -314,7 +385,7 @@ pub(crate) enum CyclicCommand {
 impl CyclicHandle {
     pub(crate) fn create(
         id: CyclicId,
-        payload_len: Arc<AtomicUsize>,
+        pending: Arc<PendingUpdate>,
         stats: Arc<SharedStats>,
         control: mpsc::UnboundedSender<CyclicCommand>,
     ) -> Self {
@@ -322,15 +393,15 @@ impl CyclicHandle {
             id,
             control,
             detached: false,
-            payload_len,
+            pending,
             stats,
         }
     }
 }
 
-pub(crate) fn new_shared(frame: Frame) -> (Arc<AtomicUsize>, Arc<SharedStats>) {
+pub(crate) fn new_shared(frame: Frame) -> (Arc<PendingUpdate>, Arc<SharedStats>) {
     (
-        Arc::new(AtomicUsize::new(frame.data().len())),
+        Arc::new(PendingUpdate::new(frame)),
         Arc::new(SharedStats::default()),
     )
 }
@@ -343,7 +414,7 @@ struct Entry {
     paused: bool,
     remaining: Option<u32>,
     generation: u64,
-    payload_len: Arc<AtomicUsize>,
+    pending: Arc<PendingUpdate>,
     stats: Arc<SharedStats>,
 }
 
@@ -357,16 +428,6 @@ fn find_entry(entries: &mut [Entry], id: CyclicId) -> Option<&mut Entry> {
 /// 酬載更新變成陳舊指令。長度不符時會忽略更新並計入
 /// [`CyclicStats::stale_payloads`]，而不是截斷或補零送出錯誤的資料；回傳值表示是否
 /// 實際套用。
-fn apply_payload(entry: &mut Entry, payload: &[u8; 64], len: u8) -> bool {
-    let data = entry.config.frame.data_mut();
-    if data.len() != usize::from(len) {
-        entry.stats.stale_payloads.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    data.copy_from_slice(&payload[..usize::from(len)]);
-    true
-}
-
 fn enqueue(
     entry: &Entry,
     sender: &mpsc::Sender<TxItem>,
@@ -399,6 +460,33 @@ fn enqueue(
     }
 }
 
+/// 陳舊 heap 節點過多時，由目前有效項目重建整個 heap。
+///
+/// `SetPeriod` 與 `Resume` 推入新節點卻不移除舊節點，`Stop` 也只從 entry
+/// 表移除項目。舊節點要等到原定到期時間才會被 generation 檢查丟棄，週期
+/// 很長時（例如 60 秒）可以累積到極大：十萬次 `set_period` 就留下十萬個
+/// 節點，整整一分鐘才慢慢清掉。
+///
+/// 重建保留現有的 generation 設計，只把垃圾清掉：每個未暫停的項目恰好
+/// 對應一個節點，暫停中的項目沒有節點（`Resume` 會重新推入）。
+fn compact_heap(heap: &mut BinaryHeap<Reverse<(Instant, u8, CyclicId, u64)>>, entries: &[Entry]) {
+    if heap.len() <= entries.len() * 4 + 64 {
+        return;
+    }
+    *heap = entries
+        .iter()
+        .filter(|entry| !entry.paused)
+        .map(|entry| {
+            Reverse((
+                entry.next,
+                entry.config.priority,
+                entry.id,
+                entry.generation,
+            ))
+        })
+        .collect();
+}
+
 /// 執行單一計時器的週期排程器。
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_scheduler(
@@ -413,6 +501,7 @@ pub(crate) async fn run_scheduler(
     let mut entries = Vec::<Entry>::new();
     let mut heap = BinaryHeap::<Reverse<(Instant, u8, CyclicId, u64)>>::new();
     loop {
+        compact_heap(&mut heap, &entries);
         let deadline = heap.peek().map_or_else(
             || Instant::now() + Duration::from_secs(86_400),
             |item| item.0.0,
@@ -421,7 +510,7 @@ pub(crate) async fn run_scheduler(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    CyclicCommand::Add { id, config, payload_len, stats } => {
+                    CyclicCommand::Add { id, config, pending, stats } => {
                         if config.period.is_zero() {
                             continue;
                         }
@@ -436,20 +525,18 @@ pub(crate) async fn run_scheduler(
                                 Repeat::Count(count) => Some(count.get()),
                             },
                             generation: 0,
-                            payload_len: Arc::clone(&payload_len),
+                            pending: Arc::clone(&pending),
                             stats: Arc::clone(&stats),
                         });
                         heap.push(Reverse((next, config.priority, id, 0)));
                     }
-                    CyclicCommand::SetPayload { id, payload, len } => {
+                    CyclicCommand::ApplyUpdate { id } => {
                         if let Some(entry) = find_entry(&mut entries, id) {
-                            let _ = apply_payload(entry, &payload, len);
-                        }
-                    }
-                    CyclicCommand::SetFrame { id, frame } => {
-                        if let Some(entry) = find_entry(&mut entries, id) {
-                            entry.config.frame = frame;
-                            entry.payload_len.store(frame.data().len(), Ordering::Release);
+                            // 先清旗標再讀值，與 CyclicHandle::wake 的「先寫值
+                            // 再設旗標」配對，確保清旗標之後寫入的新值一定會
+                            // 再排到一個命令。
+                            entry.pending.queued.store(false, Ordering::Release);
+                            entry.config.frame = entry.pending.frame();
                         }
                     }
                     CyclicCommand::SetPeriod { id, period } => {
@@ -508,10 +595,20 @@ pub(crate) async fn run_scheduler(
                         .unwrap_or(0),
                     )
                     .unwrap_or(u64::MAX);
-                    let sends = match entry.config.overrun {
+                    let wanted = match entry.config.overrun {
                         OverrunPolicy::Skip => 1,
                         OverrunPolicy::Burst => late_ticks.saturating_add(1),
                     };
+                    // 補送次數上限讓單一 tick 的工作量有確定性上界，控制命令
+                    // 因而不會被長時間停頓後的補送迴圈餓死。
+                    let sends = wanted.min(u64::from(entry.config.max_burst.get()));
+                    let over_budget = wanted - sends;
+                    if over_budget > 0 {
+                        entry
+                            .stats
+                            .skipped
+                            .fetch_add(over_budget, Ordering::Relaxed);
+                    }
                     if matches!(entry.config.overrun, OverrunPolicy::Skip) && late_ticks > 0 {
                         entry.stats.skipped.fetch_add(late_ticks, Ordering::Relaxed);
                     }
@@ -555,92 +652,27 @@ pub(crate) async fn run_scheduler(
 
 #[cfg(test)]
 mod tests {
-    use core::sync::atomic::{AtomicUsize, Ordering};
-
     use pcan_core::{CanId, Frame};
 
-    use super::{CyclicConfig, CyclicId, Entry, SharedStats, apply_payload};
-
-    /// 以指定幀建立可供酬載套用測試的週期項目。
-    fn entry(frame: Frame) -> Entry {
-        Entry {
-            id: CyclicId(1),
-            config: CyclicConfig::new(frame, core::time::Duration::from_millis(10)),
-            next: tokio::time::Instant::now(),
-            paused: false,
-            remaining: None,
-            generation: 0,
-            payload_len: std::sync::Arc::new(AtomicUsize::new(frame.data().len())),
-            stats: std::sync::Arc::new(SharedStats::default()),
-        }
-    }
+    use super::PendingUpdate;
 
     /// 驗證長度相符時會完整更新幀資料。
     #[test]
     fn matching_payload_is_applied() {
         let id = CanId::standard(0x123).expect("ID");
-        let mut entry = entry(Frame::new(id, &[0; 8]).expect("幀"));
-        let payload = [7; 64];
+        let pending = PendingUpdate::new(Frame::new(id, &[0; 8]).expect("幀"));
 
-        assert!(apply_payload(&mut entry, &payload, 8));
-        assert_eq!(entry.config.frame.data(), &[7; 8]);
+        assert!(pending.apply_payload(&[7; 8]));
+        assert_eq!(pending.frame().data(), &[7; 8]);
     }
 
-    /// 驗證幀變短後會忽略陳舊的較長酬載。
+    /// 驗證長度不符的酬載會被拒絕，且不留下部分更新。
     #[test]
-    fn stale_payload_is_ignored_when_frame_shrinks() {
+    fn mismatched_payload_is_rejected_without_partial_update() {
         let id = CanId::standard(0x123).expect("ID");
-        let mut entry = entry(Frame::new(id, &[3; 2]).expect("幀"));
-        let payload = [7; 64];
+        let pending = PendingUpdate::new(Frame::new(id, &[3; 2]).expect("幀"));
 
-        assert!(!apply_payload(&mut entry, &payload, 8));
-        assert_eq!(entry.config.frame.data(), &[3; 2]);
-    }
-
-    /// 驗證幀變長後會忽略陳舊的較短酬載。
-    #[test]
-    fn stale_payload_is_ignored_when_frame_grows() {
-        let id = CanId::standard(0x123).expect("ID");
-        let mut entry = entry(Frame::new(id, &[3; 8]).expect("幀"));
-        let payload = [7; 64];
-
-        assert!(!apply_payload(&mut entry, &payload, 2));
-        assert_eq!(entry.config.frame.data(), &[3; 8]);
-    }
-
-    /// 驗證陳舊酬載會增加統計，而正常等長更新不會增加。
-    #[test]
-    fn stale_payload_updates_are_counted() {
-        let id = CanId::standard(0x123).expect("ID");
-        let mut entry = entry(Frame::new(id, &[3; 2]).expect("幀"));
-        let payload = [7; 64];
-
-        assert!(!apply_payload(&mut entry, &payload, 8));
-        assert_eq!(entry.stats.stale_payloads.load(Ordering::Relaxed), 1);
-
-        assert!(apply_payload(&mut entry, &payload, 2));
-        assert_eq!(entry.stats.stale_payloads.load(Ordering::Relaxed), 1);
-    }
-
-    /// 驗證遠端幀會忽略非零長度的酬載。
-    #[test]
-    fn non_empty_payload_is_ignored_for_remote_frame() {
-        let id = CanId::standard(0x123).expect("ID");
-        let mut entry = entry(Frame::remote(id, 8).expect("遠端幀"));
-        let payload = [7; 64];
-
-        assert!(!apply_payload(&mut entry, &payload, 8));
-        assert!(entry.config.frame.data().is_empty());
-    }
-
-    /// 驗證遠端幀可合法套用零長度酬載。
-    #[test]
-    fn empty_payload_is_applied_to_remote_frame() {
-        let id = CanId::standard(0x123).expect("ID");
-        let mut entry = entry(Frame::remote(id, 8).expect("遠端幀"));
-        let payload = [7; 64];
-
-        assert!(apply_payload(&mut entry, &payload, 0));
-        assert!(entry.config.frame.data().is_empty());
+        assert!(!pending.apply_payload(&[7; 8]));
+        assert_eq!(pending.frame().data(), &[3; 2]);
     }
 }

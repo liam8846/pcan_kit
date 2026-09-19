@@ -3,8 +3,8 @@ use core::time::Duration;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use pcan_core::{
-    BusStatus, Capabilities, Error, FilterSet, Frame, RxFrame, Stats, StatsSnapshot,
-    TransportFactory,
+    ActiveFeatures, BusStatus, Capabilities, Error, FilterSet, Frame, RxFrame, Stats,
+    StatsSnapshot, TransportFactory,
 };
 use tokio::sync::{broadcast, oneshot, watch};
 
@@ -32,7 +32,7 @@ pub(crate) struct LinkInner {
     pub(crate) events: broadcast::Sender<BusEvent>,
     pub(crate) stats: Arc<Stats>,
     pub(crate) bus_status: Arc<Mutex<BusStatus>>,
-    pub(crate) capabilities: Arc<Mutex<Option<Capabilities>>>,
+    pub(crate) capabilities: Arc<Mutex<Option<(Capabilities, ActiveFeatures)>>>,
     pub(crate) in_flight: Arc<AtomicUsize>,
     pub(crate) tx_staged: Arc<AtomicUsize>,
     pub(crate) tx_high_water: Arc<AtomicBool>,
@@ -291,10 +291,22 @@ impl Link {
         }
     }
 
-    /// 取得當前傳輸能力；未連線時為 `None`。
+    /// 取得當前後端**具備**的能力；未連線時為 `None`。
+    ///
+    /// 回報的是「做不做得到」。要知道這次連線實際啟用了什麼，請用
+    /// [`active_features`](Self::active_features)。
     #[must_use]
     pub fn capabilities(&self) -> Option<Capabilities> {
-        *lock(&self.inner.capabilities)
+        lock(&self.inner.capabilities).map(|(capabilities, _)| capabilities)
+    }
+
+    /// 取得當前連線**實際啟用**的功能；未連線時為 `None`。
+    ///
+    /// 與 [`capabilities`](Self::capabilities) 的差別見
+    /// [`ActiveFeatures`]。重連會以新開啟的傳輸層重新填入。
+    #[must_use]
+    pub fn active_features(&self) -> Option<ActiveFeatures> {
+        lock(&self.inner.capabilities).map(|(_, active)| active)
     }
 
     /// 更新硬體或核心層過濾器，並保存供後續重連完整重放。
@@ -328,20 +340,20 @@ impl Link {
             return Err(Error::Unsupported("週期必須大於零"));
         }
         let id = CyclicId(self.inner.cyclic_next.fetch_add(1, Ordering::Relaxed));
-        let (payload_len, stats) = new_shared(config.frame);
+        let (pending, stats) = new_shared(config.frame);
         self.inner
             .channels
             .cyclic
             .send(CyclicCommand::Add {
                 id,
                 config,
-                payload_len: Arc::clone(&payload_len),
+                pending: Arc::clone(&pending),
                 stats: Arc::clone(&stats),
             })
             .map_err(|_| Error::Closed)?;
         Ok(CyclicHandle::create(
             id,
-            payload_len,
+            pending,
             stats,
             self.inner.channels.cyclic.clone(),
         ))

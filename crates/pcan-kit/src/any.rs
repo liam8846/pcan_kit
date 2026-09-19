@@ -1,7 +1,8 @@
 use core::future::Future;
 
 use pcan_core::{
-    BusStatus, Capabilities, Error, FilterSet, Frame, Transport, TransportEvent, TransportFactory,
+    ActiveFeatures, BusStatus, Capabilities, Error, FilterSet, Frame, Transport, TransportEvent,
+    TransportFactory,
 };
 
 /// 執行期可選的後端傳輸。
@@ -149,6 +150,23 @@ impl Transport for AnyTransport {
             Self::SocketCan(transport) => transport.capabilities(),
             #[cfg(feature = "test-util")]
             Self::Fake(transport) => transport.capabilities(),
+            #[cfg(not(any(
+                feature = "basic",
+                all(feature = "socketcan", target_os = "linux"),
+                feature = "test-util"
+            )))]
+            Self::Unavailable(value) => match *value {},
+        }
+    }
+
+    fn active_features(&self) -> ActiveFeatures {
+        match self {
+            #[cfg(feature = "basic")]
+            Self::Basic(transport) => transport.active_features(),
+            #[cfg(all(feature = "socketcan", target_os = "linux"))]
+            Self::SocketCan(transport) => transport.active_features(),
+            #[cfg(feature = "test-util")]
+            Self::Fake(transport) => transport.active_features(),
             #[cfg(not(any(
                 feature = "basic",
                 all(feature = "socketcan", target_os = "linux"),

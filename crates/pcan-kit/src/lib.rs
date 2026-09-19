@@ -40,10 +40,10 @@ pub use any::{AnyFactory, AnyTransport};
 pub use discover::{ChannelInfo, list_channels};
 pub use open::{open, parse_uri};
 pub use pcan_core::{
-    BackendError, Bitrate, BusState, BusStatus, BusWarnings, CanId, Capabilities, ConfigError,
-    Error, ErrorCounters, FaultKind, FilterRule, FilterSet, Frame, FrameFlags, FrameKind, IdKind,
-    LoadError, Result, RxFrame, Stats, StatsSnapshot, Timestamp, TimestampSource, Transport,
-    TransportConfig, TransportEvent, TransportFactory,
+    ActiveFeatures, BackendError, Bitrate, BusState, BusStatus, BusWarnings, CanId, Capabilities,
+    ConfigError, Error, ErrorCounters, FaultKind, FilterRule, FilterSet, Frame, FrameFlags,
+    FrameKind, IdKind, LoadError, Result, RxFrame, Stats, StatsSnapshot, Timestamp,
+    TimestampSource, Transport, TransportConfig, TransportEvent, TransportFactory,
 };
 pub use pcan_link::{
     BackoffPolicy, BusEvent, CollectMode, CyclicConfig, CyclicHandle, CyclicId, CyclicStats,

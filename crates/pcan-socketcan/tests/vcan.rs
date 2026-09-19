@@ -430,6 +430,33 @@ async fn capabilities_reflect_socket_configuration() {
     assert!(!capabilities.status_frames);
     assert!(capabilities.hardware_filter);
     assert!(!capabilities.hardware_timestamps);
+
+    let active = socket.active_features();
+    assert!(active.can_fd, "以 FD 位元率開啟時本次應啟用 FD");
+    assert!(
+        active.echo_frames,
+        "receive_own_frames 為 true 時應啟用回音"
+    );
+    assert!(!active.listen_only);
+}
+
+/// 能力與本次啟用必須是兩件事：同一張支援回音的介面，關閉 `receive_own_frames`
+/// 之後「做得到」不變，「這次有沒有開」才改變。
+#[tokio::test]
+async fn capabilities_and_active_features_are_independent() {
+    let Some(interface) = vcan() else {
+        return;
+    };
+    let socket = open_socket(&interface, false, false).await;
+
+    assert!(
+        socket.capabilities().echo_frames,
+        "核心具備回音能力，與本次設定無關"
+    );
+    assert!(
+        !socket.active_features().echo_frames,
+        "本次未要求回音，啟用狀態應為 false"
+    );
 }
 
 #[tokio::test]

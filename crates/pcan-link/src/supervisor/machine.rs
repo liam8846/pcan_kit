@@ -90,10 +90,15 @@ impl ActionSet {
 
     fn push(&mut self, action: LinkAction) {
         let index = usize::from(self.len);
-        if index < ACTION_CAPACITY {
-            self.items[index] = action;
-            self.len += 1;
-        }
+        // 靜默截斷會讓狀態機少做一個動作而毫無徵兆，例如漏掉 CloseTransport。
+        // 容量是編譯期不變式，只可能因新增動作而失效，因此在此直接斷言，
+        // 讓測試立即失敗而不是讓行為悄悄改變。
+        assert!(
+            index < ACTION_CAPACITY,
+            "單次轉移產生的動作超過 ACTION_CAPACITY；新增動作時必須同步調高容量"
+        );
+        self.items[index] = action;
+        self.len += 1;
     }
 
     /// 以連續切片查看所有動作。

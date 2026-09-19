@@ -1,0 +1,19 @@
+# 開發工具鏈固定版本。
+#
+# 沒有這個檔案時，CI 跑的是浮動的 `stable`：專案一行程式碼都沒改，只要
+# Rust 發了新版並帶進新的 clippy lint，隔天 CI 就會變紅——而且失敗會出現在
+# 當下那個 PR 上，看起來像是它造成的。dependabot 更新 bitflags 的 PR 掛在
+# `map_or` 的 lint 上就是這種情況：失敗與該變更完全無關。
+#
+# 固定之後，工具鏈升級變成一次刻意的、獨立的變更：改動下面的 `channel`，
+# 並在同一個 PR 內修掉新版 clippy 的指正。
+#
+# 這與 MSRV 是兩件事。MSRV 宣告在 Cargo.toml 的 `rust-version`，由 CI 的
+# `msrv` job 獨立驗證；那個 job 必須設定 `RUSTUP_TOOLCHAIN` 才能覆寫本檔，
+# 否則它會跑在這裡固定的版本上而不是真正的最低支援版本。
+#
+# 本檔只影響在此工作目錄樹中執行的 cargo；下游以相依套件形式建置本專案時
+# 不會讀到它。
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
