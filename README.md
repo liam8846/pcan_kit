@@ -28,6 +28,7 @@
 - [設計取捨](#設計取捨)
 - [品質保證](#品質保證)
 - [硬體驗收清單](#硬體驗收清單)
+- [變更紀錄](#變更紀錄)
 - [相容性承諾](#相容性承諾)
 - [授權](#授權)
 
@@ -518,6 +519,30 @@ Windows／PCAN-Basic 則以 PCAN-View 在相同 nominal／data bitrate 下監看
 照方向、時間戳、錯誤狀態與 bus load。
 
 </details>
+
+## 變更紀錄
+
+完整紀錄見 [CHANGELOG.md](CHANGELOG.md)，各版本的發行說明與執行檔則在
+[Releases](https://github.com/liam8846/pcan_kit/releases)。
+
+兩者都由 [git-cliff](https://git-cliff.org) 依 commit 訊息的 conventional
+prefix 自動產生（設定在 [`cliff.toml`](cliff.toml)），推送 `v*` 標籤時：
+
+1. 發行工作流程以 `git cliff --current` 產生該版本的分類說明，作為 Release
+   內容；
+2. 另一個 job 重新產生完整的 `CHANGELOG.md` 並回寫至 `master`。
+
+因此 `CHANGELOG.md` 裡某個版本的區段，是在該版本標籤推出**之後**才被提交
+的。要在本機預覽：
+
+```bash
+git cliff --output CHANGELOG.md          # 完整檔案
+git cliff --unreleased                   # 尚未發行的部分
+```
+
+這也是本專案要求 commit 訊息使用 `feat:`／`fix:` 等前綴的原因——changelog 的
+品質等同 commit 訊息的品質。不符合格式的 commit（例如 merge commit）會被排除
+而不是丟進「其他」分類。
 
 ## 相容性承諾
 

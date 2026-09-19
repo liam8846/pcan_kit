@@ -1,0 +1,82 @@
+# git-cliff 變更紀錄設定。
+#
+# 分類直接來自 commit 訊息的 conventional prefix，因此 changelog 的品質等同
+# commit 訊息的品質——這也是本專案沿用 `feat:`／`fix:` 等前綴的理由之一。
+#
+# 本機重新產生完整檔案：
+#
+#   git cliff --output CHANGELOG.md
+#
+# 發行工作流程只取單一版本的區段（`--current`），不需要手動介入。
+
+[changelog]
+header = """
+# 變更紀錄
+
+本檔案由 [git-cliff](https://git-cliff.org) 依 commit 訊息自動產生，請勿手動編輯。
+版本號遵循 [SemVer](https://semver.org/lang/zh-TW/)；0.x 期間破壞性變更會提升 minor 版本。
+"""
+
+# 分類標題前的 `<!-- nn -->` 只用來決定顯示順序，輸出前由 striptags 去除。
+# 沒有它時分類會依字串排序，「修正」會排在「新功能」前面。
+body = """
+
+{% if version -%}
+## [{{ version | trim_start_matches(pat="v") }}](https://github.com/liam8846/pcan_kit/releases/tag/{{ version }}) — {{ timestamp | date(format="%Y-%m-%d") }}
+{%- else -%}
+## 未發布
+{%- endif %}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim }}
+{% for commit in commits %}
+- {{ commit.message | split(pat="\n") | first | trim }} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/liam8846/pcan_kit/commit/{{ commit.id }}))
+{%- endfor %}
+{% endfor %}
+"""
+
+footer = ""
+
+trim = true
+
+# commit 主旨裡的 `(#21)` 轉成 PR 連結。TOML 的單引號字串不處理跳脫字元，
+# 因此這裡的反斜線就是正規表示式本身的反斜線。
+postprocessors = [
+  { pattern = '\(#(\d+)\)', replace = "([#$1](https://github.com/liam8846/pcan_kit/pull/$1))" },
+]
+
+[git]
+conventional_commits = true
+# 不符合 conventional 格式的 commit（例如 GitHub 的 merge commit）直接排除，
+# 而不是丟進「其他」分類——那只會讓 changelog 充滿雜訊。
+filter_unconventional = true
+filter_commits = false
+split_commits = false
+protect_breaking_commits = false
+tag_pattern = "v[0-9]*"
+topo_order = false
+sort_commits = "oldest"
+
+commit_preprocessors = [
+  # 去除主旨結尾多餘空白，避免產生的清單項目出現尾隨空格。
+  { pattern = ' +$', replace = "" },
+]
+
+commit_parsers = [
+  # 相依套件更新量大且與使用者無關，集中成一段放在最後，不與功能變更混雜。
+  { message = "^chore\\(deps\\)", group = "<!-- 08 -->相依套件" },
+  { message = "^chore: bump", group = "<!-- 08 -->相依套件" },
+  { message = "^feat", group = "<!-- 00 -->新功能" },
+  { message = "^fix", group = "<!-- 01 -->修正" },
+  { message = "^perf", group = "<!-- 02 -->效能" },
+  { message = "^refactor", group = "<!-- 03 -->重構" },
+  { message = "^revert", group = "<!-- 04 -->回復" },
+  { message = "^docs", group = "<!-- 05 -->文件" },
+  { message = "^test", group = "<!-- 06 -->測試" },
+  { message = "^ci", group = "<!-- 07 -->持續整合" },
+  { message = "^build", group = "<!-- 07 -->持續整合" },
+  # 版本號提升 commit 本身沒有資訊量，版本標題已經表達了同一件事。
+  { message = "^chore: release", skip = true },
+  # 發行流程自動回寫 changelog 的提交，不該出現在下一版的 changelog 裡。
+  { message = "^chore: 更新變更紀錄", skip = true },
+  { message = "^chore", group = "<!-- 09 -->維護" },
+]
