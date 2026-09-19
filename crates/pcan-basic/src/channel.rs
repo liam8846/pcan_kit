@@ -159,6 +159,10 @@ pub struct PcanChannel {
     caps: Capabilities,
     fd_mode: bool,
     tx_lock: Mutex<()>,
+    /// 保護 FFI 生命週期：所有針對 `handle` 的同步 PCAN 呼叫都必須在此閘門
+    /// 內進行，並在取得後重新確認 `closed`，確保 `CAN_Uninitialize` 之後不會
+    /// 再有任何操作觸及已解除初始化的 handle。絕不跨越 `.await` 持有。
+    ffi_gate: std::sync::Mutex<()>,
     closed: AtomicBool,
     api: Arc<PcanApi>,
 }
@@ -176,6 +180,16 @@ impl core::fmt::Debug for PcanChannel {
 }
 
 impl PcanChannel {
+    /// 取得 FFI 生命週期閘門。
+    ///
+    /// 閘門不保護任何資料，只序列化 handle 的使用與解除初始化，因此中毒時
+    /// 直接取回內層守衛即可。
+    fn lock_ffi(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.ffi_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn close_sync(&self) {
         if self
             .closed
@@ -185,6 +199,10 @@ impl PcanChannel {
             return;
         }
         self.rx.stop();
+        // closed 已先設為 true，因此任何已通過第一次檢查、但尚未進入 FFI 的
+        // 操作都會在閘門內重新檢查後放棄；取得閘門即代表沒有 FFI 呼叫正在
+        // 使用 handle。
+        let _ffi = self.lock_ffi();
         let status = self.api.uninitialize(self.handle);
         if status != 0 {
             #[cfg(feature = "tracing")]
@@ -226,14 +244,21 @@ impl Transport for PcanChannel {
             }
             let _guard = self.tx_lock.lock().await;
             for attempt in 0..=8 {
-                let status = if self.fd_mode {
-                    let message = frame_to_msg_fd(&frame);
-                    self.api
-                        .write_fd(self.handle, &message)
-                        .ok_or(Error::Unsupported("PCAN-Basic 不提供 CAN_WriteFD"))?
-                } else {
-                    let message = frame_to_msg(&frame)?;
-                    self.api.write(self.handle, &message)
+                // 閘門只包住同步 FFI 呼叫；重試前的 sleep 不持有它。
+                let status = {
+                    let _ffi = self.lock_ffi();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(Error::Closed);
+                    }
+                    if self.fd_mode {
+                        let message = frame_to_msg_fd(&frame);
+                        self.api
+                            .write_fd(self.handle, &message)
+                            .ok_or(Error::Unsupported("PCAN-Basic 不提供 CAN_WriteFD"))?
+                    } else {
+                        let message = frame_to_msg(&frame)?;
+                        self.api.write(self.handle, &message)
+                    }
                 };
                 match classify(status) {
                     StatusOutcome::Ok { .. } => return Ok(()),
@@ -282,7 +307,13 @@ impl Transport for PcanChannel {
             if self.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed);
             }
-            let status = self.api.get_status(self.handle);
+            let status = {
+                let _ffi = self.lock_ffi();
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
+                self.api.get_status(self.handle)
+            };
             match classify(status) {
                 StatusOutcome::Failed { .. }
                     if bus_state_of(status) == pcan_core::BusState::BusOff =>
@@ -317,6 +348,10 @@ impl Transport for PcanChannel {
     fn set_filter(&self, filter: &FilterSet) -> impl Future<Output = Result<(), Error>> + Send {
         let filter = filter.clone();
         async move {
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed);
+            }
+            let _ffi = self.lock_ffi();
             if self.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed);
             }
@@ -543,6 +578,7 @@ impl PcanFactory {
             caps,
             fd_mode,
             tx_lock: Mutex::new(()),
+            ffi_gate: std::sync::Mutex::new(()),
             closed: AtomicBool::new(false),
             api: Arc::clone(&self.api),
         })
