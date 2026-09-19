@@ -75,9 +75,11 @@ crates.io，請以 git 相依引入並鎖定標籤：
 
 ```toml
 [dependencies]
-pcan-kit = { git = "https://github.com/liam8846/pcan_kit", tag = "v0.2.3" }
+pcan-kit = { git = "https://github.com/liam8846/pcan_kit", tag = "v0.2.4" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ```
+
+最新版本請見 [Releases](https://github.com/liam8846/pcan_kit/releases)。
 
 函式庫**不包含也不重新散布** PEAK 的驅動或 DLL，請見[前置設定](#前置設定)。
 
