@@ -42,9 +42,12 @@ fn errno_kind(error: &io::Error) -> FaultKind {
 
 /// Linux `SocketCAN` 後端設定。
 ///
-/// `common.bitrate` 不會設定核心介面的實際位元率；它只決定是否要求
-/// `CAN_RAW_FD_FRAMES`。位元率必須由系統管理層先以 `ip link set ...`
-/// 設定，函式庫既無法可靠推知控制器時鐘，也不會猜測現有介面設定。
+/// `common.bitrate` 不會設定核心介面的實際位元率；它只決定本次開啟是否啟用
+/// `CAN_RAW_FD_FRAMES`。以 [`Bitrate::Classic`](pcan_core::Bitrate::Classic)
+/// 開啟時 FD 模式會保持關閉，送出 FD 幀會得到
+/// [`Error::Unsupported`]，與 PCAN-Basic 古典模式的語意一致。位元率必須由
+/// 系統管理層先以 `ip link set ...` 設定，函式庫既無法可靠推知控制器時鐘，
+/// 也不會猜測現有介面設定。
 /// 同理，Bus-Off 自動復歸由介面的 `restart-ms` 管理；SocketCAN 沒有
 /// PCAN 式獨立狀態幀，狀態變化來自啟用的核心錯誤幀。
 #[derive(Clone, Debug)]
@@ -393,14 +396,29 @@ impl CanSocket {
             });
         }
         let one = 1_i32;
-        let fd_enabled =
+        let wants_fd = config.common.bitrate.is_fd();
+        // 探測與啟用是兩件事。socket 此時尚未 bind，也還沒送出任何資料，因
+        // 此打開再關回去不會影響匯流排；這一次 setsockopt 只回答「核心認不
+        // 認得 CAN_RAW_FD_FRAMES」，要不要真的用 FD 由 bitrate 決定。
+        let supports_fd =
             set_socket_option(raw_fd, libc::SOL_CAN_RAW, libc::CAN_RAW_FD_FRAMES, &one).is_ok();
-        if config.common.bitrate.is_fd() && !fd_enabled {
+        if wants_fd && !supports_fd {
             return Err(Error::Unsupported(
                 "核心或 SocketCAN 介面不支援 CAN_RAW_FD_FRAMES",
             ));
         }
-        if !fd_enabled {
+        let fd_enabled = wants_fd && supports_fd;
+        if supports_fd && !fd_enabled {
+            // 古典位元率必須把探測時打開的 FD 模式關回去。留著會讓
+            // ActiveFeatures 宣稱的「本次沒開 FD」與核心實際接受 FD 幀的行
+            // 為不一致，也會讓 SocketCAN 古典模式與 PCAN-Basic 古典模式的跨
+            // 後端語意分岔——後者明確拒絕 FD 幀。
+            let zero = 0_i32;
+            set_socket_option(raw_fd, libc::SOL_CAN_RAW, libc::CAN_RAW_FD_FRAMES, &zero).map_err(
+                |source| socket_error("setsockopt(CAN_RAW_FD_FRAMES, 0)", FaultKind::Fatal, source),
+            )?;
+        }
+        if !supports_fd {
             #[cfg(feature = "tracing")]
             tracing::warn!("SocketCAN 不支援 CAN FD，能力已降級為古典 CAN");
         }
@@ -476,10 +494,11 @@ impl CanSocket {
         let io = AsyncFd::new(owned)
             .map_err(|source| socket_error("AsyncFd::new(SocketCAN)", FaultKind::Fatal, source))?;
         let mut caps = Capabilities::default();
-        // fd_enabled 來自無條件的 CAN_RAW_FD_FRAMES 探測，與使用者是否要求
-        // FD 無關，因此它回答的正是「這個核心與介面做不做得到 FD」。
-        caps.can_fd = fd_enabled;
-        caps.brs = fd_enabled;
+        // supports_fd 來自無條件的 CAN_RAW_FD_FRAMES 探測，與使用者是否要求
+        // FD 無關，因此它回答的正是「這個核心做不做得到 FD」；本次有沒有真
+        // 的以 FD 開啟則由下方的 ActiveFeatures 回報。
+        caps.can_fd = supports_fd;
+        caps.brs = supports_fd;
         // CAN_RAW_RECV_OWN_MSGS 設定失敗會中止開啟流程，抵達此處即代表核心
         // 具備回音能力；本次有沒有開由 ActiveFeatures 回報。
         caps.echo_frames = true;
