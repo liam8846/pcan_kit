@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use pcan_core::{
-    BackendError, Bitrate, BusStatus, CanId, Capabilities, ConfigError, Error, FaultKind,
-    FilterSet, Frame, FrameFlags, RxFrame, Timestamp, TimestampSource, Transport, TransportConfig,
-    TransportEvent, TransportFactory, len_to_dlc,
+    ActiveFeatures, BackendError, Bitrate, BusStatus, CanId, Capabilities, ConfigError, Error,
+    FaultKind, FilterSet, Frame, FrameFlags, RxFrame, Timestamp, TimestampSource, Transport,
+    TransportConfig, TransportEvent, TransportFactory, len_to_dlc,
 };
 use tokio::io::unix::AsyncFd;
+use tokio::sync::watch;
 
 use crate::errframe::parse_error_frame;
 
@@ -41,9 +42,12 @@ fn errno_kind(error: &io::Error) -> FaultKind {
 
 /// Linux `SocketCAN` 後端設定。
 ///
-/// `common.bitrate` 不會設定核心介面的實際位元率；它只決定是否要求
-/// `CAN_RAW_FD_FRAMES`。位元率必須由系統管理層先以 `ip link set ...`
-/// 設定，函式庫既無法可靠推知控制器時鐘，也不會猜測現有介面設定。
+/// `common.bitrate` 不會設定核心介面的實際位元率；它只決定本次開啟是否啟用
+/// `CAN_RAW_FD_FRAMES`。以 [`Bitrate::Classic`](pcan_core::Bitrate::Classic)
+/// 開啟時 FD 模式會保持關閉，送出 FD 幀會得到
+/// [`Error::Unsupported`]，與 PCAN-Basic 古典模式的語意一致。位元率必須由
+/// 系統管理層先以 `ip link set ...` 設定，函式庫既無法可靠推知控制器時鐘，
+/// 也不會猜測現有介面設定。
 /// 同理，Bus-Off 自動復歸由介面的 `restart-ms` 管理；SocketCAN 沒有
 /// PCAN 式獨立狀態幀，狀態變化來自啟用的核心錯誤幀。
 #[derive(Clone, Debug)]
@@ -303,8 +307,29 @@ fn control_timestamp(header: &libc::msghdr) -> Option<Timestamp> {
 pub struct CanSocket {
     io: AsyncFd<OwnedFd>,
     caps: Capabilities,
+    active: ActiveFeatures,
+    /// 這個 socket 是否真的啟用了 `CAN_RAW_FD_FRAMES`。
+    ///
+    /// 送出閘門刻意用這個私有欄位而不是 `caps.can_fd`：`Capabilities` 是
+    /// 「後端做得到什麼」的公開契約，把執行期的拒絕條件綁在它上面，日後
+    /// 任何契約調整都會無聲地改變哪些幀送得出去。
+    fd_enabled: bool,
     kernel_timestamps: bool,
     closed: AtomicBool,
+    /// 關閉信號的發送端；`close()` 以此喚醒所有停在 I/O 就緒上的操作。
+    ///
+    /// 單靠 `closed` 這個 atomic 無法終止進行中的 I/O：已經 park 在
+    /// `readable()`/`writable()` 的工作等的是該 fd 的 epoll 就緒，而
+    /// `close()` 既不觸碰 fd 也不觸碰 reactor，atomic 的變動不會喚醒任何人。
+    /// 匯流排安靜時該工作會永久等待。
+    shutdown: watch::Sender<bool>,
+    /// 建構時建立、之後永不輪詢的原始 receiver。
+    ///
+    /// 每次操作都從它複製，複本因而繼承「尚未看過初始值」的版本號：即使
+    /// `close()` 早已發生，`changed()` 仍會立即返回，不存在訂閱時機造成的
+    /// 漏接窗口。這也是選用 `watch` 而非 `Notify` 的原因——後者的
+    /// `notify_waiters()` 不留存信號，在「檢查旗標後、註冊前」關閉就會漏接。
+    shutdown_rx: watch::Receiver<bool>,
     status: Mutex<BusStatus>,
 }
 
@@ -314,6 +339,7 @@ impl core::fmt::Debug for CanSocket {
             .debug_struct("CanSocket")
             .field("fd", &self.io.get_ref().as_raw_fd())
             .field("caps", &self.caps)
+            .field("active", &self.active)
             .field("kernel_timestamps", &self.kernel_timestamps)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -370,14 +396,29 @@ impl CanSocket {
             });
         }
         let one = 1_i32;
-        let fd_enabled =
+        let wants_fd = config.common.bitrate.is_fd();
+        // 探測與啟用是兩件事。socket 此時尚未 bind，也還沒送出任何資料，因
+        // 此打開再關回去不會影響匯流排；這一次 setsockopt 只回答「核心認不
+        // 認得 CAN_RAW_FD_FRAMES」，要不要真的用 FD 由 bitrate 決定。
+        let supports_fd =
             set_socket_option(raw_fd, libc::SOL_CAN_RAW, libc::CAN_RAW_FD_FRAMES, &one).is_ok();
-        if config.common.bitrate.is_fd() && !fd_enabled {
+        if wants_fd && !supports_fd {
             return Err(Error::Unsupported(
                 "核心或 SocketCAN 介面不支援 CAN_RAW_FD_FRAMES",
             ));
         }
-        if !fd_enabled {
+        let fd_enabled = wants_fd && supports_fd;
+        if supports_fd && !fd_enabled {
+            // 古典位元率必須把探測時打開的 FD 模式關回去。留著會讓
+            // ActiveFeatures 宣稱的「本次沒開 FD」與核心實際接受 FD 幀的行
+            // 為不一致，也會讓 SocketCAN 古典模式與 PCAN-Basic 古典模式的跨
+            // 後端語意分岔——後者明確拒絕 FD 幀。
+            let zero = 0_i32;
+            set_socket_option(raw_fd, libc::SOL_CAN_RAW, libc::CAN_RAW_FD_FRAMES, &zero).map_err(
+                |source| socket_error("setsockopt(CAN_RAW_FD_FRAMES, 0)", FaultKind::Fatal, source),
+            )?;
+        }
+        if !supports_fd {
             #[cfg(feature = "tracing")]
             tracing::warn!("SocketCAN 不支援 CAN FD，能力已降級為古典 CAN");
         }
@@ -453,23 +494,50 @@ impl CanSocket {
         let io = AsyncFd::new(owned)
             .map_err(|source| socket_error("AsyncFd::new(SocketCAN)", FaultKind::Fatal, source))?;
         let mut caps = Capabilities::default();
-        caps.can_fd = fd_enabled;
-        caps.brs = fd_enabled;
-        caps.echo_frames = config.common.receive_own_frames;
+        // supports_fd 來自無條件的 CAN_RAW_FD_FRAMES 探測，與使用者是否要求
+        // FD 無關，因此它回答的正是「這個核心做不做得到 FD」；本次有沒有真
+        // 的以 FD 開啟則由下方的 ActiveFeatures 回報。
+        caps.can_fd = supports_fd;
+        caps.brs = supports_fd;
+        // CAN_RAW_RECV_OWN_MSGS 設定失敗會中止開啟流程，抵達此處即代表核心
+        // 具備回音能力；本次有沒有開由 ActiveFeatures 回報。
+        caps.echo_frames = true;
         // CAN_RAW_ERR_FILTER 必須設定成功才會繼續開啟流程，因此後端確實具備此能力。
         caps.error_frames = true;
         // SocketCAN 以錯誤幀推導匯流排狀態，沒有可獨立接收的狀態幀。
         caps.status_frames = false;
         caps.hardware_filter = true;
         caps.hardware_timestamps = false;
+        // 唯聽必須由 ip link 在介面層設定，開啟流程已在最前面拒絕該請求。
         caps.listen_only = false;
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let mut active = ActiveFeatures::default();
+        active.can_fd = fd_enabled;
+        active.brs = fd_enabled;
+        active.echo_frames = config.common.receive_own_frames;
+        active.error_frames = config.common.receive_error_frames;
+        active.status_frames = false;
+        active.listen_only = false;
         Ok(Self {
             io,
             caps,
+            active,
+            fd_enabled,
             kernel_timestamps,
             closed: AtomicBool::new(false),
+            shutdown,
+            shutdown_rx,
             status: Mutex::new(BusStatus::default()),
         })
+    }
+
+    /// 等待關閉信號；`close()` 觸發後立即完成。
+    ///
+    /// `changed()` 只在 Sender 被丟棄時回傳 `Err`，而 Sender 是 `self` 的欄
+    /// 位、與 `&self` 同生命週期，該情形同樣代表不應再繼續，故一律視為關閉。
+    async fn shutdown_signal(&self) {
+        let mut receiver = self.shutdown_rx.clone();
+        let _result = receiver.changed().await;
     }
 
     fn try_recv_one(&self) -> Result<Option<TransportEvent>, Error> {
@@ -603,16 +671,27 @@ impl CanSocket {
 impl Transport for CanSocket {
     fn recv(&self) -> impl Future<Output = Result<TransportEvent, Error>> + Send {
         async move {
-            if self.closed.load(Ordering::Acquire) {
-                return Err(Error::Closed);
-            }
             loop {
+                // 每圈重檢：try_recv_one 是真正的 recvmsg，關閉後不得再取出
+                // 幀交給呼叫端。
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
                 if let Some(event) = self.try_recv_one()? {
                     return Ok(event);
                 }
-                let mut guard = self.io.readable().await.map_err(|source| {
-                    socket_error("AsyncFd::readable(SocketCAN)", FaultKind::Fatal, source)
-                })?;
+                // 同時等待就緒與關閉；biased 使兩者皆就緒時優先收斂到關閉。
+                let mut guard = tokio::select! {
+                    biased;
+                    () = self.shutdown_signal() => return Err(Error::Closed),
+                    result = self.io.readable() => result.map_err(|source| {
+                        socket_error("AsyncFd::readable(SocketCAN)", FaultKind::Fatal, source)
+                    })?,
+                };
+                // 等待期間可能已關閉：喚醒與 try_io 之間必須再確認一次。
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
                 let mut backend_failure = None;
                 // 與 PCAN Linux 路徑相同，必須由 try_io 依 ReadyEvent tick
                 // 清除 EPOLLET 就緒；讀空後手動 clear_ready 會抹掉競態期間
@@ -643,10 +722,15 @@ impl Transport for CanSocket {
             if self.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed);
             }
-            if frame.is_fd() && !self.caps.can_fd {
+            if frame.is_fd() && !self.fd_enabled {
                 return Err(Error::Unsupported("此 SocketCAN socket 未啟用 CAN FD"));
             }
             loop {
+                // 每圈重檢：try_send_one 會真的把幀送上匯流排，close() 回傳
+                // 之後不得再發生。
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
                 match self.try_send_one(&frame) {
                     Ok(()) => return Ok(()),
                     Err(source)
@@ -655,9 +739,17 @@ impl Transport for CanSocket {
                         return Err(socket_error("send(SocketCAN)", errno_kind(&source), source));
                     }
                 }
-                let mut guard = self.io.writable().await.map_err(|source| {
-                    socket_error("AsyncFd::writable(SocketCAN)", FaultKind::Fatal, source)
-                })?;
+                let mut guard = tokio::select! {
+                    biased;
+                    () = self.shutdown_signal() => return Err(Error::Closed),
+                    result = self.io.writable() => result.map_err(|source| {
+                        socket_error("AsyncFd::writable(SocketCAN)", FaultKind::Fatal, source)
+                    })?,
+                };
+                // 等待期間可能已關閉：喚醒與 try_io 之間必須再確認一次。
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
                 match guard.try_io(|_| match self.try_send_one(&frame) {
                     Ok(()) => Ok(()),
                     Err(source)
@@ -698,12 +790,20 @@ impl Transport for CanSocket {
     }
 
     fn close(&self) -> impl Future<Output = ()> + Send {
+        // 先設旗標再送信號：被信號喚醒的操作必定觀察得到 closed == true。
         self.closed.store(true, Ordering::Release);
+        // send_replace 不因無訂閱者而失敗，且無條件推進版本號，重複 close
+        // 亦安全。
+        let _previous = self.shutdown.send_replace(true);
         core::future::ready(())
     }
 
     fn capabilities(&self) -> Capabilities {
         self.caps
+    }
+
+    fn active_features(&self) -> ActiveFeatures {
+        self.active
     }
 }
 

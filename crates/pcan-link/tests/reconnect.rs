@@ -5,8 +5,8 @@ use core::time::Duration;
 
 use pcan_core::testing::{FakeFactory, FakeTransport, FakeTransportBuilder};
 use pcan_core::{
-    BusState, BusStatus, BusWarnings, CanId, Capabilities, FaultKind, FilterRule, FilterSet, Frame,
-    Result, Transport, TransportEvent, TransportFactory,
+    ActiveFeatures, BusState, BusStatus, BusWarnings, CanId, Capabilities, FaultKind, FilterRule,
+    FilterSet, Frame, Result, Transport, TransportEvent, TransportFactory,
 };
 use pcan_link::{BackoffPolicy, BusEvent, Link, LinkState, PendingTxPolicy};
 
@@ -43,6 +43,10 @@ impl Transport for HangingStatus {
 
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+
+    fn active_features(&self) -> ActiveFeatures {
+        self.inner.active_features()
     }
 }
 

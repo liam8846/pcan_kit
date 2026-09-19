@@ -69,6 +69,12 @@ struct WinRxThread {
     rx_event: OwnedEvent,
     receiver: tokio::sync::Mutex<mpsc::Receiver<Result<TransportEvent, Error>>>,
     closed: AtomicBool,
+    /// 與 RX 執行緒共享的停止旗標。
+    ///
+    /// `stop_event` 只有外層 `WaitForMultipleObjects` 會觀察；執行緒卡在內層
+    /// 排空迴圈的回壓等待時完全看不到它。此旗標讓回壓等待每圈都能察覺停止
+    /// 請求，使 `join()` 不再依賴非同步消費者是否被排程。
+    stop_flag: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
 }
 
@@ -119,6 +125,8 @@ impl WinRxThread {
         let thread_rx = rx_event.0 as usize;
         let dropped = Arc::new(AtomicU64::new(0));
         let thread_dropped = Arc::clone(&dropped);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let thread_stop_flag = Arc::clone(&stop_flag);
         let join = std::thread::Builder::new()
             .name(format!("pcan-rx-{handle:04x}"))
             .spawn(move || {
@@ -135,9 +143,11 @@ impl WinRxThread {
                             match read_one(&api, handle, fd_mode) {
                                 Ok(ReadOutcome::Event(event)) => {
                                     let keep_running = match policy {
-                                        RxThreadPolicy::Backpressure => {
-                                            sender.blocking_send(Ok(event)).is_ok()
-                                        }
+                                        RxThreadPolicy::Backpressure => super::backpressure_send(
+                                            &sender,
+                                            &thread_stop_flag,
+                                            Ok(event),
+                                        ),
                                         RxThreadPolicy::DropOnFull => {
                                             match sender.try_send(Ok(event)) {
                                                 Ok(()) => true,
@@ -155,7 +165,13 @@ impl WinRxThread {
                                 }
                                 Ok(ReadOutcome::Empty) => break,
                                 Err(error) => {
-                                    let _closed = sender.blocking_send(Err(error)).is_err();
+                                    // 同樣不可用 blocking_send：佇列滿時只會把
+                                    // 同一個死結搬到錯誤回報這條路徑上。
+                                    let _delivered = super::backpressure_send(
+                                        &sender,
+                                        &thread_stop_flag,
+                                        Err(error),
+                                    );
                                     return;
                                 }
                             }
@@ -175,7 +191,8 @@ impl WinRxThread {
                         op: "WaitForMultipleObjects",
                         kind: FaultKind::Fatal,
                     });
-                    let _closed = sender.blocking_send(Err(error)).is_err();
+                    let _delivered =
+                        super::backpressure_send(&sender, &thread_stop_flag, Err(error));
                     break;
                 }
             })
@@ -193,6 +210,7 @@ impl WinRxThread {
             rx_event,
             receiver: tokio::sync::Mutex::new(receiver),
             closed: AtomicBool::new(false),
+            stop_flag,
             dropped,
         })
     }
@@ -209,6 +227,11 @@ impl WinRxThread {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        // 必須先豎旗標再 join：卡在內層排空迴圈回壓等待的執行緒看不到
+        // `stop_event`，只有這個旗標能讓它收斂。
+        self.stop_flag.store(true, Ordering::Release);
+        // 關閉接收端能立即中止回壓，但消費者 park 在 `recv()` 時仍持有該
+        // Mutex，`try_lock` 會失敗；因此這只是快速路徑，不能當唯一機制。
         if let Ok(mut receiver) = self.receiver.try_lock() {
             receiver.close();
         }

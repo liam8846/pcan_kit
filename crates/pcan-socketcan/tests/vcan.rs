@@ -430,6 +430,88 @@ async fn capabilities_reflect_socket_configuration() {
     assert!(!capabilities.status_frames);
     assert!(capabilities.hardware_filter);
     assert!(!capabilities.hardware_timestamps);
+
+    let active = socket.active_features();
+    assert!(active.can_fd, "以 FD 位元率開啟時本次應啟用 FD");
+    assert!(
+        active.echo_frames,
+        "receive_own_frames 為 true 時應啟用回音"
+    );
+    assert!(!active.listen_only);
+}
+
+/// 能力與本次啟用必須是兩件事：同一張支援回音的介面，關閉 `receive_own_frames`
+/// 之後「做得到」不變，「這次有沒有開」才改變。
+#[tokio::test]
+async fn capabilities_and_active_features_are_independent() {
+    let Some(interface) = vcan() else {
+        return;
+    };
+    let socket = open_socket(&interface, false, false).await;
+
+    assert!(
+        socket.capabilities().echo_frames,
+        "核心具備回音能力，與本次設定無關"
+    );
+    assert!(
+        !socket.active_features().echo_frames,
+        "本次未要求回音，啟用狀態應為 false"
+    );
+}
+
+/// 古典位元率必須真的維持古典語意：`CAN_RAW_FD_FRAMES` 不啟用，送出 FD 幀
+/// 被明確拒絕。
+///
+/// 這是跨後端契約而不只是本後端的細節：PCAN-Basic 古典模式同樣以
+/// [`Error::Unsupported`] 拒絕 FD 幀。若 `SocketCAN` 因為探測時順手打開 FD 就
+/// 默默接受 FD 幀，同一份應用程式在兩個後端上的行為會分岔，`ActiveFeatures`
+/// 也會與實際可送出的幀不一致。
+#[tokio::test]
+async fn classic_bitrate_keeps_fd_disabled_and_rejects_fd_frames() {
+    let Some(interface) = vcan() else {
+        return;
+    };
+    let classic = open_socket(&interface, false, false).await;
+    let fd = open_socket(&interface, true, false).await;
+
+    // 能力層回答「核心做不做得到」，不隨本次要求的位元率改變。這裡刻意比較
+    // 兩個 socket 而不是硬寫 true：舊核心不支援 CAN_RAW_FD_FRAMES 時
+    // 兩邊都會是 false，而「不隨位元率改變」這個不變式仍必須成立。
+    assert_eq!(
+        classic.capabilities().can_fd,
+        fd.capabilities().can_fd,
+        "Capabilities::can_fd 是核心能力，不應隨開啟時的位元率改變"
+    );
+    assert_eq!(
+        classic.capabilities().brs,
+        fd.capabilities().brs,
+        "Capabilities::brs 是核心能力，不應隨開啟時的位元率改變"
+    );
+
+    // 啟用層回答「這次有沒有開」，必須隨位元率改變。
+    assert!(
+        !classic.active_features().can_fd,
+        "以古典位元率開啟時本次不應啟用 FD"
+    );
+    assert!(
+        !classic.active_features().brs,
+        "以古典位元率開啟時本次不應啟用 BRS"
+    );
+    assert!(
+        fd.active_features().can_fd,
+        "以 FD 位元率開啟時本次應啟用 FD"
+    );
+
+    let fd_frame = Frame::new_fd(standard(16, 0), &[0x16; 12], true).expect("12-byte FD 幀應合法");
+    match classic.send(&fd_frame).await {
+        Err(Error::Unsupported(_)) => {}
+        Err(other) => panic!("古典模式送 FD 幀應回 Error::Unsupported，實際：{other:?}"),
+        Ok(()) => panic!("古典模式不得接受 FD 幀"),
+    }
+
+    // 古典幀在同一個 socket 上仍必須正常送出：拒絕的是 FD，不是整個傳送路徑。
+    let classic_frame = Frame::new(standard(16, 1), &[0x16, 0x20]).expect("古典幀應合法");
+    send(&classic, &classic_frame).await;
 }
 
 #[tokio::test]
@@ -520,6 +602,43 @@ async fn close_is_idempotent_and_reports_closed() {
         socket.set_filter(&FilterSet::accept_all()).await,
         Err(Error::Closed)
     ));
+}
+
+/// 迴歸測試：`close()` 必須終止「已經停在 I/O 就緒上」的 recv。
+///
+/// 只設旗標的實作在此會永久掛住：park 在 `readable()` 的工作等的是 fd 的
+/// epoll 就緒，而 `close()` 不觸碰 fd，靜止的 vcan 上永遠不會有就緒事件。
+///
+/// 對應的 send 路徑無法在 vcan 上測——socket 幾乎永遠可寫，要逼它 park 必須
+/// 製造 ENOBUFS，而本檔開頭已說明那不該寫成測試。
+#[tokio::test]
+async fn close_cancels_a_recv_already_waiting() {
+    const PARK_DELAY: Duration = Duration::from_millis(100);
+
+    let Some(interface) = vcan() else {
+        return;
+    };
+    let socket = Arc::new(open_socket(&interface, false, false).await);
+    let waiting_socket = Arc::clone(&socket);
+    let waiter = tokio::spawn(async move { waiting_socket.recv().await });
+
+    // 靜止的 vcan 上沒有任何流量，這段延遲足以讓 recv 走完入口檢查並真的
+    // park 在 readable() 上。
+    tokio::time::sleep(PARK_DELAY).await;
+    socket.close().await;
+
+    match tokio::time::timeout(RECV_TIMEOUT, waiter).await {
+        Err(elapsed) => {
+            panic!("close() 沒有喚醒已在等待的 recv：{RECV_TIMEOUT:?} 內未返回：{elapsed}")
+        }
+        Ok(joined) => assert!(
+            matches!(
+                joined.expect("等待中的 recv task 不應 panic"),
+                Err(Error::Closed)
+            ),
+            "已在等待的 recv 應以 Error::Closed 結束"
+        ),
+    }
 }
 
 #[tokio::test]

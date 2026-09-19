@@ -40,17 +40,18 @@ pub use any::{AnyFactory, AnyTransport};
 pub use discover::{ChannelInfo, list_channels};
 pub use open::{open, parse_uri};
 pub use pcan_core::{
-    BackendError, Bitrate, BusState, BusStatus, BusWarnings, CanId, Capabilities, ConfigError,
-    Error, ErrorCounters, FaultKind, FilterRule, FilterSet, Frame, FrameFlags, FrameKind, IdKind,
-    LoadError, Result, RxFrame, Stats, StatsSnapshot, Timestamp, TimestampSource, Transport,
-    TransportConfig, TransportEvent, TransportFactory,
+    ActiveFeatures, BackendError, Bitrate, BusState, BusStatus, BusWarnings, CanId, Capabilities,
+    ConfigError, Error, ErrorCounters, FaultKind, FilterRule, FilterSet, Frame, FrameFlags,
+    FrameKind, IdKind, LoadError, Result, RxFrame, Stats, StatsSnapshot, Timestamp,
+    TimestampSource, Transport, TransportConfig, TransportEvent, TransportFactory,
 };
 pub use pcan_link::{
     BackoffPolicy, BusEvent, CollectMode, CyclicConfig, CyclicHandle, CyclicId, CyclicStats,
     FaultCause, Jitter, Link, LinkAction, LinkBuilder, LinkInput, LinkMachine, LinkState,
-    MatchResult, Matcher, NoJitter, OverflowPolicy, OverrunPolicy, PendingResponse,
-    PendingTxPolicy, PrefixPattern, RejectReason, Repeat, ResponseSpec, SplitMixJitter,
-    SubscribeConfig, Subscription, SubscriptionId, TransactionError, TxGate, TxQueueDepth,
+    MAX_PENDING_CYCLIC_ADDS, MatchResult, Matcher, NoJitter, OverflowPolicy, OverrunPolicy,
+    PendingResponse, PendingTxPolicy, PrefixPattern, RejectReason, Repeat, ResponseSpec,
+    SplitMixJitter, SubscribeConfig, Subscription, SubscriptionId, TransactionError, TxGate,
+    TxQueueDepth,
 };
 
 #[cfg(feature = "basic")]

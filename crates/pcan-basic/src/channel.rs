@@ -12,8 +12,8 @@ use pcan_basic_sys::{
     load_from, warnings_of,
 };
 use pcan_core::{
-    BackendError, Bitrate, BusStatus, Capabilities, Error, FaultKind, FilterSet, Frame, Transport,
-    TransportEvent, TransportFactory,
+    ActiveFeatures, BackendError, Bitrate, BusStatus, Capabilities, Error, FaultKind, FilterSet,
+    Frame, Transport, TransportEvent, TransportFactory,
 };
 use tokio::sync::{Mutex, Semaphore};
 
@@ -157,8 +157,13 @@ pub struct PcanChannel {
     rx: RxSource,
     handle: TPCANHandle,
     caps: Capabilities,
+    active: ActiveFeatures,
     fd_mode: bool,
     tx_lock: Mutex<()>,
+    /// 保護 FFI 生命週期：所有針對 `handle` 的同步 PCAN 呼叫都必須在此閘門
+    /// 內進行，並在取得後重新確認 `closed`，確保 `CAN_Uninitialize` 之後不會
+    /// 再有任何操作觸及已解除初始化的 handle。絕不跨越 `.await` 持有。
+    ffi_gate: std::sync::Mutex<()>,
     closed: AtomicBool,
     api: Arc<PcanApi>,
 }
@@ -169,6 +174,7 @@ impl core::fmt::Debug for PcanChannel {
             .debug_struct("PcanChannel")
             .field("handle", &self.handle)
             .field("caps", &self.caps)
+            .field("active", &self.active)
             .field("fd_mode", &self.fd_mode)
             .field("closed", &self.closed.load(Ordering::Relaxed))
             .finish_non_exhaustive()
@@ -176,6 +182,16 @@ impl core::fmt::Debug for PcanChannel {
 }
 
 impl PcanChannel {
+    /// 取得 FFI 生命週期閘門。
+    ///
+    /// 閘門不保護任何資料，只序列化 handle 的使用與解除初始化，因此中毒時
+    /// 直接取回內層守衛即可。
+    fn lock_ffi(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.ffi_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn close_sync(&self) {
         if self
             .closed
@@ -185,6 +201,10 @@ impl PcanChannel {
             return;
         }
         self.rx.stop();
+        // closed 已先設為 true，因此任何已通過第一次檢查、但尚未進入 FFI 的
+        // 操作都會在閘門內重新檢查後放棄；取得閘門即代表沒有 FFI 呼叫正在
+        // 使用 handle。
+        let _ffi = self.lock_ffi();
         let status = self.api.uninitialize(self.handle);
         if status != 0 {
             #[cfg(feature = "tracing")]
@@ -226,14 +246,21 @@ impl Transport for PcanChannel {
             }
             let _guard = self.tx_lock.lock().await;
             for attempt in 0..=8 {
-                let status = if self.fd_mode {
-                    let message = frame_to_msg_fd(&frame);
-                    self.api
-                        .write_fd(self.handle, &message)
-                        .ok_or(Error::Unsupported("PCAN-Basic 不提供 CAN_WriteFD"))?
-                } else {
-                    let message = frame_to_msg(&frame)?;
-                    self.api.write(self.handle, &message)
+                // 閘門只包住同步 FFI 呼叫；重試前的 sleep 不持有它。
+                let status = {
+                    let _ffi = self.lock_ffi();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(Error::Closed);
+                    }
+                    if self.fd_mode {
+                        let message = frame_to_msg_fd(&frame);
+                        self.api
+                            .write_fd(self.handle, &message)
+                            .ok_or(Error::Unsupported("PCAN-Basic 不提供 CAN_WriteFD"))?
+                    } else {
+                        let message = frame_to_msg(&frame)?;
+                        self.api.write(self.handle, &message)
+                    }
                 };
                 match classify(status) {
                     StatusOutcome::Ok { .. } => return Ok(()),
@@ -282,7 +309,13 @@ impl Transport for PcanChannel {
             if self.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed);
             }
-            let status = self.api.get_status(self.handle);
+            let status = {
+                let _ffi = self.lock_ffi();
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(Error::Closed);
+                }
+                self.api.get_status(self.handle)
+            };
             match classify(status) {
                 StatusOutcome::Failed { .. }
                     if bus_state_of(status) == pcan_core::BusState::BusOff =>
@@ -320,6 +353,10 @@ impl Transport for PcanChannel {
             if self.closed.load(Ordering::Acquire) {
                 return Err(Error::Closed);
             }
+            let _ffi = self.lock_ffi();
+            if self.closed.load(Ordering::Acquire) {
+                return Err(Error::Closed);
+            }
             apply_filter(&self.api, self.handle, &filter)
         }
     }
@@ -332,6 +369,10 @@ impl Transport for PcanChannel {
 
     fn capabilities(&self) -> Capabilities {
         self.caps
+    }
+
+    fn active_features(&self) -> ActiveFeatures {
+        self.active
     }
 }
 
@@ -528,8 +569,10 @@ impl PcanFactory {
             return Err(error);
         }
         let mut caps = Capabilities::default();
-        caps.can_fd = fd_mode;
-        caps.brs = fd_mode;
+        // 後端能力，與本次如何開啟無關：載入的 PCAN-Basic 是否提供完整 FD
+        // API，決定這個後端做不做得到 FD，而不是這次有沒有用 FD。
+        caps.can_fd = self.api.supports_fd();
+        caps.brs = self.api.supports_fd();
         caps.echo_frames = echo_frames;
         // PCAN_ALLOW_ERROR_FRAMES 與 PCAN_ALLOW_STATUS_FRAMES 已由上方必要參數迴圈以 required_status 驗證；抵達此處代表驅動已接受兩者。
         caps.error_frames = true;
@@ -537,12 +580,22 @@ impl PcanFactory {
         caps.hardware_filter = true;
         caps.hardware_timestamps = true;
         caps.listen_only = true;
+        // 本次實際啟用的功能，全部取自這次開啟用的設定。
+        let mut active = ActiveFeatures::default();
+        active.can_fd = fd_mode;
+        active.brs = fd_mode;
+        active.echo_frames = echo_frames && self.config.common.receive_own_frames;
+        active.error_frames = self.config.common.receive_error_frames;
+        active.status_frames = self.config.common.receive_status_frames;
+        active.listen_only = self.config.common.listen_only;
         Ok(PcanChannel {
             rx,
             handle,
             caps,
+            active,
             fd_mode,
             tx_lock: Mutex::new(()),
+            ffi_gate: std::sync::Mutex::new(()),
             closed: AtomicBool::new(false),
             api: Arc::clone(&self.api),
         })

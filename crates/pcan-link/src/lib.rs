@@ -27,10 +27,13 @@ pub mod transaction;
 pub mod txqueue;
 
 pub use builder::LinkBuilder;
-pub use cyclic::{CyclicConfig, CyclicHandle, CyclicId, CyclicStats, OverrunPolicy, Repeat};
+pub use cyclic::{
+    CyclicConfig, CyclicHandle, CyclicId, CyclicStats, MAX_PENDING_CYCLIC_ADDS, OverrunPolicy,
+    Repeat,
+};
 pub use events::{BusEvent, FaultCause};
 pub use link::Link;
-pub use pcan_core::{Capabilities, Error, StatsSnapshot};
+pub use pcan_core::{ActiveFeatures, Capabilities, Error, StatsSnapshot};
 pub use router::{OverflowPolicy, SubscribeConfig, Subscription, SubscriptionId};
 pub use supervisor::backoff::{BackoffPolicy, Jitter, NoJitter, SplitMixJitter};
 pub use supervisor::machine::{ActionSet, LinkAction, LinkInput, LinkMachine, LinkState};

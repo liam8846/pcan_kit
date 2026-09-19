@@ -18,10 +18,12 @@ jobs:
     steps:
       - name: 取出原始碼
         uses: actions/checkout@v7
-      - name: 安裝 Rust 工具鏈
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: 安裝固定版 Rust 工具鏈
+        # 版本與元件由 rust-toolchain.toml 決定，不再使用浮動的 stable；
+        # 無參數的 rustup toolchain install 會直接依該檔案安裝。
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
       - name: 快取 Rust 建置資料
         uses: Swatinem/rust-cache@v2
         with:
@@ -40,10 +42,12 @@ jobs:
     steps:
       - name: 取出原始碼
         uses: actions/checkout@v7
-      - name: 安裝 Rust 工具鏈
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: 安裝固定版 Rust 工具鏈
+        # 版本與元件由 rust-toolchain.toml 決定，不再使用浮動的 stable；
+        # 無參數的 rustup toolchain install 會直接依該檔案安裝。
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
       - name: 快取 Rust 建置資料
         uses: Swatinem/rust-cache@v2
         with:
@@ -64,8 +68,12 @@ jobs:
     steps:
       - name: 取出原始碼
         uses: actions/checkout@v7
-      - name: 安裝 Rust 工具鏈
-        uses: dtolnay/rust-toolchain@stable
+      - name: 安裝固定版 Rust 工具鏈
+        # 版本與元件由 rust-toolchain.toml 決定，不再使用浮動的 stable；
+        # 無參數的 rustup toolchain install 會直接依該檔案安裝。
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
       - name: 快取 Rust 建置資料
         uses: Swatinem/rust-cache@v2
         with:
@@ -88,8 +96,12 @@ jobs:
     steps:
       - name: 取出原始碼
         uses: actions/checkout@v7
-      - name: 安裝 Rust 工具鏈
-        uses: dtolnay/rust-toolchain@stable
+      - name: 安裝固定版 Rust 工具鏈
+        # 版本與元件由 rust-toolchain.toml 決定，不再使用浮動的 stable；
+        # 無參數的 rustup toolchain install 會直接依該檔案安裝。
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
       - name: 快取 Rust 建置資料
         uses: Swatinem/rust-cache@v2
         with:
@@ -121,6 +133,11 @@ jobs:
           key: msrv
           save-if: "${{ github.ref == 'refs/heads/master' }}"
       - name: 以最低支援版本檢查
+        env:
+          # rust-toolchain.toml 會把此工作目錄內的 cargo 呼叫導向固定的開發
+          # 工具鏈。RUSTUP_TOOLCHAIN 的優先序高於該檔案，是本 job 真的跑在
+          # 宣告的 MSRV 上、而不是靜默地跑在開發版本上的唯一保證。
+          RUSTUP_TOOLCHAIN: "${{ steps.msrv.outputs.version }}"
         run: cargo check --workspace --all-features --locked
 
   vcan:
@@ -131,8 +148,12 @@ jobs:
     steps:
       - name: 取出原始碼
         uses: actions/checkout@v7
-      - name: 安裝 Rust 工具鏈
-        uses: dtolnay/rust-toolchain@stable
+      - name: 安裝固定版 Rust 工具鏈
+        # 版本與元件由 rust-toolchain.toml 決定，不再使用浮動的 stable；
+        # 無參數的 rustup toolchain install 會直接依該檔案安裝。
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
       - name: 快取虛擬 CAN 建置資料
         uses: Swatinem/rust-cache@v2
         with:
@@ -203,9 +224,12 @@ jobs:
           else
             echo "run=false" >> "$GITHUB_OUTPUT"; echo "本次沒有 Cargo.toml 變更，略過"
           fi
-      - name: 安裝 Rust 工具鏈
+      - name: 安裝固定版 Rust 工具鏈
         if: steps.gate.outputs.run == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        # 版本與元件由 rust-toolchain.toml 決定。
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
       - name: 安裝功能組合檢查工具
         if: steps.gate.outputs.run == 'true'
         uses: taiki-e/install-action@v2.87.1

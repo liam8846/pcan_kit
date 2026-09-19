@@ -10,7 +10,7 @@ use crate::error::{BackendError, Error, FaultKind, Result};
 use crate::filter::FilterSet;
 use crate::frame::Frame;
 use crate::status::BusStatus;
-use crate::transport::{Capabilities, Transport, TransportEvent, TransportFactory};
+use crate::transport::{ActiveFeatures, Capabilities, Transport, TransportEvent, TransportFactory};
 
 #[derive(Clone, Copy, Debug)]
 enum RecvItem {
@@ -31,6 +31,7 @@ struct FakeState {
     tx_failure_kind: Option<FaultKind>,
     tx_busy_remaining: u32,
     capabilities: Capabilities,
+    active_features: ActiveFeatures,
     fault_after: Option<(usize, FaultKind)>,
     fault_after_fired: bool,
     delivered_events: usize,
@@ -80,6 +81,7 @@ fn shared_from_builder(builder: FakeTransportBuilder, is_open: bool) -> (Arc<Sha
         tx_failure_kind: builder.tx_failure_kind,
         tx_busy_remaining: builder.tx_busy_times,
         capabilities: builder.capabilities,
+        active_features: builder.active_features,
         fault_after: builder.fault_after,
         fault_after_fired: false,
         delivered_events: 0,
@@ -115,6 +117,7 @@ pub struct FakeTransportBuilder {
     tx_failure_kind: Option<FaultKind>,
     tx_busy_times: u32,
     capabilities: Capabilities,
+    active_features: ActiveFeatures,
     panic_on_recv: bool,
 }
 
@@ -171,10 +174,17 @@ impl FakeTransportBuilder {
         self
     }
 
-    /// 設定假後端回報的執行期能力。
+    /// 設定假後端回報的後端能力。
     #[must_use]
     pub fn capabilities(mut self, capabilities: Capabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// 設定假後端回報的本次啟用功能。
+    #[must_use]
+    pub fn active_features(mut self, active_features: ActiveFeatures) -> Self {
+        self.active_features = active_features;
         self
     }
 
@@ -339,6 +349,10 @@ impl Transport for FakeTransport {
 
     fn capabilities(&self) -> Capabilities {
         lock_state(&self.shared).capabilities
+    }
+
+    fn active_features(&self) -> ActiveFeatures {
+        lock_state(&self.shared).active_features
     }
 }
 
