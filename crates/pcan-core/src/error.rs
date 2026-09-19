@@ -88,6 +88,17 @@ pub enum Error {
         capacity: usize,
     },
 
+    /// 控制命令佇列已滿，背景任務來不及消化。
+    ///
+    /// 控制通道本身必須維持 unbounded——`Drop` 也要用它送清理命令，而 `Drop`
+    /// 不能 `.await`——因此新增項目改以固定名額准入。名額會在背景任務取走該
+    /// 命令時歸還，呼叫端稍後重試即可。
+    #[error("控制命令佇列已滿（容量 {capacity}）")]
+    ControlQueueFull {
+        /// 未處理控制命令的名額上限。
+        capacity: usize,
+    },
+
     /// 操作未在期限內完成。
     #[error("操作逾時（{}ms）", .timeout.as_millis())]
     Timeout {
@@ -110,7 +121,9 @@ impl Error {
             }
             Self::Open { source, .. } | Self::Io(source) => source.fault_kind(),
             Self::BusOff | Self::Disconnected { .. } => FaultKind::Fatal,
-            Self::TxQueueFull { .. } | Self::Timeout { .. } => FaultKind::Transient,
+            Self::TxQueueFull { .. } | Self::ControlQueueFull { .. } | Self::Timeout { .. } => {
+                FaultKind::Transient
+            }
         }
     }
 
@@ -264,6 +277,10 @@ mod tests {
             (Error::Closed, FaultKind::Permanent),
             (Error::Disconnected { attempt: 2 }, FaultKind::Fatal),
             (Error::TxQueueFull { capacity: 16 }, FaultKind::Transient),
+            (
+                Error::ControlQueueFull { capacity: 256 },
+                FaultKind::Transient,
+            ),
             (
                 Error::Timeout {
                     timeout: Duration::from_millis(1),

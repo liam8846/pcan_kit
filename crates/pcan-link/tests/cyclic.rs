@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use pcan_core::testing::{FakeFactory, FakeTransportBuilder};
 use pcan_core::{CanId, Frame};
-use pcan_link::{BusEvent, CyclicConfig, Link, OverrunPolicy, Repeat};
+use pcan_link::{
+    BusEvent, CyclicConfig, Error, Link, MAX_PENDING_CYCLIC_ADDS, OverrunPolicy, Repeat,
+};
 use tokio::sync::broadcast;
 
 async fn settle() {
@@ -229,6 +231,50 @@ async fn rapid_payload_updates_coalesce_to_the_latest_value() {
     let sent = handle.sent();
     assert_eq!(sent.len(), 1, "一個週期只應送出一幀");
     assert_eq!(sent[0].data(), &[UPDATES], "合併後必須套用最後一次更新的值");
+}
+
+/// 未處理的新增命令必須有確定性上界，名額並在排程器取走後歸還。
+///
+/// 其他控制命令都能合併或計數，新增不行：每一筆都帶著各自的設定與共享槽，
+/// 必須原樣送達。因此改以固定名額准入，這是控制平面最後一條可能無限成長的
+/// 路徑。
+///
+/// 本測試在 current-thread runtime 上建立 `Link` 之後完全不 await，排程器
+/// task 因而一次都沒有執行，所有新增命令都留在控制通道裡——上界是否成立可以
+/// 被確定性地斷言，而不是靠時序碰運氣。
+#[tokio::test(start_paused = true)]
+async fn pending_cyclic_adds_are_bounded_and_slots_are_returned() {
+    let (factory, _handle) = FakeFactory::new(FakeTransportBuilder::default());
+    let link = Link::builder(factory).health_check_interval(None).build();
+    let config = CyclicConfig::new(frame(8), Duration::from_secs(3600));
+
+    // 刻意不 await：排程器還沒有機會取走任何一筆新增命令。
+    let mut handles = Vec::with_capacity(MAX_PENDING_CYCLIC_ADDS);
+    for index in 0..MAX_PENDING_CYCLIC_ADDS {
+        match link.schedule_cyclic(config) {
+            Ok(handle) => handles.push(handle),
+            Err(error) => panic!("第 {index} 筆新增在名額用盡前就失敗：{error:?}"),
+        }
+    }
+
+    match link.schedule_cyclic(config) {
+        Err(Error::ControlQueueFull { capacity }) => {
+            assert_eq!(capacity, MAX_PENDING_CYCLIC_ADDS, "錯誤必須帶回實際上界");
+        }
+        Err(other) => panic!("名額用盡時應回 ControlQueueFull，實際：{other:?}"),
+        Ok(_) => panic!("名額已用盡，第 {} 筆不得成功", MAX_PENDING_CYCLIC_ADDS + 1),
+    }
+
+    // 讓排程器取走待處理的新增命令，名額隨命令被丟棄而歸還。
+    settle().await;
+    let recovered = link
+        .schedule_cyclic(config)
+        .expect("排程器消化之後名額必須重新可用");
+    handles.push(recovered);
+
+    // 名額歸還的是「未處理命令」的額度，不是「存活項目」的額度：上面 257 個
+    // 項目全部仍在排程器裡。
+    assert_eq!(handles.len(), MAX_PENDING_CYCLIC_ADDS + 1);
 }
 
 /// 高頻同步控制呼叫必須合併，而不是在控制通道裡無限堆積。

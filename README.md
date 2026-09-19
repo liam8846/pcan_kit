@@ -385,12 +385,20 @@ PCAN 開啟所需的阻塞 FFI 與接收執行緒建立會在 Tokio 阻塞執行
 暫停、恢復、單次觸發或 detach。`OverrunPolicy` 與 `with_max_burst` 決定系統
 延遲造成落後時要補送幾幀，避免喚醒延遲後一次爆出大量幀。
 
-這些控制方法都是同步函式，因此全部走「最新狀態合併」而非逐一排入命令：不論
-呼叫多快，單一排程項目最多只會有一個未處理的控制命令，排程器只看到最後一個
-值。`trigger_once` 是事件而非狀態，改以計數累積，未處理數同樣封頂於
-`max_burst`，溢位計入 `CyclicStats::skipped`。控制通道本身必須維持
-unbounded——`Drop` 也要用它送停止命令，而 `Drop` 不能 `.await`——上界因此來自
-合併設計本身，而不是通道容量。
+控制通道本身必須維持 unbounded——`Drop` 也要用它送停止命令，而 `Drop` 不能
+`.await`——因此上界來自命令本身的設計，而不是通道容量。三類控制命令各有不同
+的處理方式：
+
+| 類別 | 例子 | 上界來源 |
+|---|---|---|
+| 狀態變更 | `set_payload`、`set_frame`、`set_period`、`pause`／`resume` | 合併為最新值，單一項目最多一個未處理命令 |
+| 事件 | `trigger_once` | 計數累積，封頂於 `max_burst`，溢位計入 `CyclicStats::skipped` |
+| 新增項目 | `schedule_cyclic` | 固定名額准入（`MAX_PENDING_CYCLIC_ADDS`，256），用盡時回 `Error::ControlQueueFull` |
+| 清理 | `Drop` 送出的停止命令 | 與存活控制代碼一一對應，且不可阻塞 |
+
+名額在排程器取走新增命令時歸還，因此限制的是「未處理命令」而不是「存活項目
+數」。訂閱與交易註冊則本來就自限：兩者都要等背景任務回覆，交易另受
+`max_in_flight_transactions` 限制。
 
 ## 設計取捨
 

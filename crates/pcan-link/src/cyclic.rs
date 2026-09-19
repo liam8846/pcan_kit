@@ -6,7 +6,7 @@ use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use pcan_core::{Error, Frame, Stats};
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use crate::LinkState;
@@ -444,6 +444,16 @@ impl Drop for CyclicHandle {
     }
 }
 
+/// 未被排程器取走的新增命令名額上限。
+///
+/// 其他控制命令都能合併或計數，新增項目不行：每一筆都帶著各自的設定與共享
+/// 槽，必須原樣送達。因此改以固定名額准入——名額用盡時
+/// [`Link::schedule_cyclic`](crate::Link::schedule_cyclic) 立即回
+/// [`Error::ControlQueueFull`]，而不是讓未處理的新增命令無限堆積。
+///
+/// 256 遠高於任何合理的「同時建立多少個週期項目」，卻仍是確定性的上界。
+pub const MAX_PENDING_CYCLIC_ADDS: usize = 256;
+
 #[derive(Debug)]
 pub(crate) enum CyclicCommand {
     Add {
@@ -451,6 +461,13 @@ pub(crate) enum CyclicCommand {
         config: CyclicConfig,
         pending: Arc<PendingUpdate>,
         stats: Arc<SharedStats>,
+        /// 准入名額。排程器取走本命令、離開該 match 分支時自動歸還。
+        ///
+        /// 用 permit 而不是自行維護計數，是因為每一條釋放路徑都必須歸還名
+        /// 額：`send` 失敗時命令被丟棄、排程器關閉時通道裡的命令被丟棄、正
+        /// 常處理完畢——這三條路徑全部由 `Drop` 覆蓋，不會有某條錯誤路徑忘
+        /// 記歸還。
+        _admission: OwnedSemaphorePermit,
     },
     /// 合併後的控制變更；實際新值由共享槽讀取。
     ///
@@ -594,7 +611,7 @@ pub(crate) async fn run_scheduler(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    CyclicCommand::Add { id, config, pending, stats } => {
+                    CyclicCommand::Add { id, config, pending, stats, _admission } => {
                         if config.period.is_zero() {
                             continue;
                         }

@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pcan_core::{BusStatus, Error, FilterSet, Stats, TransportFactory};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Semaphore, broadcast, watch};
 
 use crate::LinkState;
+use crate::cyclic::MAX_PENDING_CYCLIC_ADDS;
 use crate::link::{Link, LinkInner};
 use crate::supervisor::backoff::BackoffPolicy;
 use crate::supervisor::{RuntimeConfig, SharedRuntime, spawn};
@@ -219,6 +220,7 @@ impl<F: TransportFactory> LinkBuilder<F> {
                 tx_capacity,
                 tx_high_water_ratio: self.tx_high_water_ratio,
                 cyclic_next: AtomicU64::new(1),
+                cyclic_add_slots: Arc::new(Semaphore::new(MAX_PENDING_CYCLIC_ADDS)),
             }),
         }
     }

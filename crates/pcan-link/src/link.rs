@@ -6,11 +6,13 @@ use pcan_core::{
     ActiveFeatures, BusStatus, Capabilities, Error, FilterSet, Frame, RxFrame, Stats,
     StatsSnapshot, TransportFactory,
 };
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{Semaphore, broadcast, oneshot, watch};
 
 use crate::LinkState;
 use crate::builder::LinkBuilder;
-use crate::cyclic::{CyclicCommand, CyclicConfig, CyclicHandle, CyclicId, new_shared};
+use crate::cyclic::{
+    CyclicCommand, CyclicConfig, CyclicHandle, CyclicId, MAX_PENDING_CYCLIC_ADDS, new_shared,
+};
 use crate::events::BusEvent;
 use crate::router::{RouterCommand, SubscribeConfig, Subscription};
 use crate::supervisor::{RuntimeChannels, SupervisorCommand};
@@ -41,6 +43,8 @@ pub(crate) struct LinkInner {
     pub(crate) tx_capacity: usize,
     pub(crate) tx_high_water_ratio: Option<f32>,
     pub(crate) cyclic_next: AtomicU64,
+    /// 未處理 [`CyclicCommand::Add`] 的准入名額。
+    pub(crate) cyclic_add_slots: Arc<Semaphore>,
 }
 
 impl core::fmt::Debug for LinkInner {
@@ -332,13 +336,23 @@ impl Link {
 
     /// 註冊週期傳送項目。
     ///
+    /// 已建立的項目之後都以合併控制命令操作，唯獨建立本身無法合併——每一筆
+    /// 都帶著各自的設定與共享槽。因此新增採固定名額准入：未被排程器取走的
+    /// 新增命令達到上限時立即回 [`Error::ControlQueueFull`]，名額會在排程器
+    /// 取走命令時歸還，呼叫端稍後重試即可。
+    ///
     /// # Errors
     ///
-    /// 週期為零或排程器已關閉時回傳錯誤。
+    /// 週期為零、未處理的新增命令已達上限或排程器已關閉時回傳錯誤。
     pub fn schedule_cyclic(&self, config: CyclicConfig) -> Result<CyclicHandle, Error> {
         if config.period.is_zero() {
             return Err(Error::Unsupported("週期必須大於零"));
         }
+        let admission = Arc::clone(&self.inner.cyclic_add_slots)
+            .try_acquire_owned()
+            .map_err(|_| Error::ControlQueueFull {
+                capacity: MAX_PENDING_CYCLIC_ADDS,
+            })?;
         let id = CyclicId(self.inner.cyclic_next.fetch_add(1, Ordering::Relaxed));
         let (pending, stats) = new_shared(&config);
         self.inner
@@ -349,6 +363,7 @@ impl Link {
                 config,
                 pending: Arc::clone(&pending),
                 stats: Arc::clone(&stats),
+                _admission: admission,
             })
             .map_err(|_| Error::Closed)?;
         Ok(CyclicHandle::create(

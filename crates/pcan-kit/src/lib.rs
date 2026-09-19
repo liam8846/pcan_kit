@@ -48,9 +48,10 @@ pub use pcan_core::{
 pub use pcan_link::{
     BackoffPolicy, BusEvent, CollectMode, CyclicConfig, CyclicHandle, CyclicId, CyclicStats,
     FaultCause, Jitter, Link, LinkAction, LinkBuilder, LinkInput, LinkMachine, LinkState,
-    MatchResult, Matcher, NoJitter, OverflowPolicy, OverrunPolicy, PendingResponse,
-    PendingTxPolicy, PrefixPattern, RejectReason, Repeat, ResponseSpec, SplitMixJitter,
-    SubscribeConfig, Subscription, SubscriptionId, TransactionError, TxGate, TxQueueDepth,
+    MAX_PENDING_CYCLIC_ADDS, MatchResult, Matcher, NoJitter, OverflowPolicy, OverrunPolicy,
+    PendingResponse, PendingTxPolicy, PrefixPattern, RejectReason, Repeat, ResponseSpec,
+    SplitMixJitter, SubscribeConfig, Subscription, SubscriptionId, TransactionError, TxGate,
+    TxQueueDepth,
 };
 
 #[cfg(feature = "basic")]
