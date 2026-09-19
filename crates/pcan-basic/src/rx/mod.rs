@@ -147,6 +147,41 @@ pub(crate) fn read_one(
     }
 }
 
+/// Backpressure 佇列滿時的輪詢間隔。
+const BACKPRESSURE_POLL: core::time::Duration = core::time::Duration::from_micros(200);
+
+/// 以可被停止請求中斷的方式回壓送出；回傳 `false` 代表應結束 RX 執行緒。
+///
+/// 不能直接用 `blocking_send`：它只在通道關閉時返回，而關閉是由 `stop()` 的
+/// best-effort `try_lock` 驅動的——消費者 park 在 `Receiver::recv()` 時仍持有
+/// 那個 Mutex，`try_lock` 會失敗，通道不會關閉。`stop()` 接著 `join()`，若 RX
+/// 執行緒正卡在 `blocking_send`，而排空通道所需的非同步消費者又因 runtime
+/// 執行緒被 `join()` 阻塞而無法被輪詢（單執行緒 runtime 必然如此），兩邊就
+/// 互相等待成死結。
+///
+/// 改為輪詢 `try_send` 並在每圈檢查停止旗標後，`join()` 的完成條件不再依賴
+/// 消費者是否被排程。回壓語意保留：佇列滿時仍不丟幀，只是改以等待表達。
+pub(crate) fn backpressure_send(
+    sender: &tokio::sync::mpsc::Sender<Result<TransportEvent, Error>>,
+    stop: &core::sync::atomic::AtomicBool,
+    message: Result<TransportEvent, Error>,
+) -> bool {
+    let mut pending = message;
+    loop {
+        if stop.load(core::sync::atomic::Ordering::Acquire) {
+            return false;
+        }
+        match sender.try_send(pending) {
+            Ok(()) => return true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                pending = returned;
+                std::thread::sleep(BACKPRESSURE_POLL);
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+}
+
 #[cfg(unix)]
 pub(crate) struct ThreadRx {
     receiver: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Result<TransportEvent, Error>>>,
@@ -191,7 +226,7 @@ impl ThreadRx {
                         Ok(ReadOutcome::Event(event)) => {
                             let sent = match policy {
                                 crate::config::RxThreadPolicy::Backpressure => {
-                                    sender.blocking_send(Ok(event)).is_ok()
+                                    backpressure_send(&sender, &thread_stop, Ok(event))
                                 }
                                 crate::config::RxThreadPolicy::DropOnFull => {
                                     match sender.try_send(Ok(event)) {
@@ -219,7 +254,9 @@ impl ThreadRx {
                             }
                         }
                         Err(error) => {
-                            let _closed = sender.blocking_send(Err(error)).is_err();
+                            // 同樣不可用 blocking_send：佇列滿時只會把同一個
+                            // 死結搬到錯誤回報這條路徑上。
+                            let _delivered = backpressure_send(&sender, &thread_stop, Err(error));
                             break;
                         }
                     }
@@ -247,7 +284,10 @@ impl ThreadRx {
     }
 
     pub(crate) fn stop(&self) {
+        // 必須先豎旗標再 join：卡在回壓等待的執行緒只能靠它收斂。
         self.stop.store(true, std::sync::atomic::Ordering::Release);
+        // 關閉接收端能立即中止回壓，但消費者 park 在 `recv()` 時仍持有該
+        // Mutex，`try_lock` 會失敗；因此這只是快速路徑，不能當唯一機制。
         if let Ok(mut receiver) = self.receiver.try_lock() {
             receiver.close();
         }
@@ -265,5 +305,89 @@ impl ThreadRx {
 impl Drop for ThreadRx {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::time::Duration;
+    use std::sync::Arc;
+
+    use pcan_core::Error;
+    use tokio::sync::mpsc::{channel, error::TryRecvError};
+
+    use super::backpressure_send;
+
+    const DRAIN_DELAY: Duration = Duration::from_millis(20);
+
+    /// 死結的核心性質：回壓等待必須能被停止請求中斷。
+    ///
+    /// 這裡刻意讓佇列滿、消費者從不排空、通道也不關閉——正是 `stop()` 的
+    /// `try_lock` 失敗時的狀態。舊版的 `blocking_send` 在此會永久阻塞，
+    /// 使 `join()` 永遠不返回。
+    #[test]
+    fn backpressure_wait_is_interrupted_by_stop() {
+        let (sender, _receiver) = channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        sender
+            .try_send(Err(Error::Closed))
+            .expect("首筆應填滿容量 1 的佇列");
+
+        let waker_stop = Arc::clone(&stop);
+        let waker = std::thread::spawn(move || {
+            std::thread::sleep(DRAIN_DELAY);
+            waker_stop.store(true, Ordering::Release);
+        });
+
+        assert!(
+            !backpressure_send(&sender, &stop, Err(Error::Closed)),
+            "停止請求應中斷回壓等待並要求結束執行緒"
+        );
+        waker.join().expect("喚醒執行緒不應 panic");
+    }
+
+    /// 回壓語意必須保留：佇列滿時等待，而不是丟棄。
+    #[test]
+    fn backpressure_waits_instead_of_dropping() {
+        let (sender, mut receiver) = channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        sender
+            .try_send(Err(Error::Closed))
+            .expect("首筆應填滿容量 1 的佇列");
+
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(DRAIN_DELAY);
+            let _first = receiver.try_recv().expect("延遲後應能排空第一筆");
+            loop {
+                match receiver.try_recv() {
+                    Ok(message) => return message,
+                    Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(1)),
+                    Err(TryRecvError::Disconnected) => panic!("回壓期間第二筆被丟棄了"),
+                }
+            }
+        });
+
+        assert!(
+            backpressure_send(&sender, &stop, Err(Error::Unsupported("第二筆"))),
+            "消費者排空後回壓應成功送出"
+        );
+        let delivered = drainer.join().expect("排空執行緒不應 panic");
+        assert!(
+            matches!(delivered, Err(Error::Unsupported("第二筆"))),
+            "回壓應原樣送達第二筆，不得丟棄或改寫"
+        );
+    }
+
+    #[test]
+    fn backpressure_send_reports_a_closed_channel() {
+        let (sender, receiver) = channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        drop(receiver);
+
+        assert!(
+            !backpressure_send(&sender, &stop, Err(Error::Closed)),
+            "通道關閉應要求結束執行緒"
+        );
     }
 }
