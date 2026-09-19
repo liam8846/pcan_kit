@@ -134,7 +134,7 @@ impl PcanChannelInfo {
     #[must_use]
     pub fn name(&self) -> &str {
         let length = usize::from(self.name_len);
-        str::from_utf8(&self.name[..length]).map_or("", core::convert::identity)
+        str::from_utf8(&self.name[..length]).unwrap_or("")
     }
 
     /// 判斷通道目前是否可供連線。
@@ -212,7 +212,7 @@ fn info_from_raw(raw: &TPCANChannelInformation) -> PcanChannelInfo {
         device_id: raw.device_id,
         condition: channel_condition(raw.channel_condition),
         name,
-        name_len: u8::try_from(valid_name.len()).map_or(0, |length| length),
+        name_len: u8::try_from(valid_name.len()).unwrap_or(0),
     }
 }
 
