@@ -21,7 +21,7 @@ vcan-tests = []
 [dependencies]
 pcan-core = { workspace = true }
 libc = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["rt", "sync", "time", "net", "macros"] }
 tracing = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -522,6 +522,43 @@ async fn close_is_idempotent_and_reports_closed() {
     ));
 }
 
+/// 迴歸測試：`close()` 必須終止「已經停在 I/O 就緒上」的 recv。
+///
+/// 只設旗標的實作在此會永久掛住：park 在 `readable()` 的工作等的是 fd 的
+/// epoll 就緒，而 `close()` 不觸碰 fd，靜止的 vcan 上永遠不會有就緒事件。
+///
+/// 對應的 send 路徑無法在 vcan 上測——socket 幾乎永遠可寫，要逼它 park 必須
+/// 製造 ENOBUFS，而本檔開頭已說明那不該寫成測試。
+#[tokio::test]
+async fn close_cancels_a_recv_already_waiting() {
+    const PARK_DELAY: Duration = Duration::from_millis(100);
+
+    let Some(interface) = vcan() else {
+        return;
+    };
+    let socket = Arc::new(open_socket(&interface, false, false).await);
+    let waiting_socket = Arc::clone(&socket);
+    let waiter = tokio::spawn(async move { waiting_socket.recv().await });
+
+    // 靜止的 vcan 上沒有任何流量，這段延遲足以讓 recv 走完入口檢查並真的
+    // park 在 readable() 上。
+    tokio::time::sleep(PARK_DELAY).await;
+    socket.close().await;
+
+    match tokio::time::timeout(RECV_TIMEOUT, waiter).await {
+        Err(elapsed) => {
+            panic!("close() 沒有喚醒已在等待的 recv：{RECV_TIMEOUT:?} 內未返回：{elapsed}")
+        }
+        Ok(joined) => assert!(
+            matches!(
+                joined.expect("等待中的 recv task 不應 panic"),
+                Err(Error::Closed)
+            ),
+            "已在等待的 recv 應以 Error::Closed 結束"
+        ),
+    }
+}
+
 #[tokio::test]
 async fn opening_a_missing_interface_reports_open_error() {
     let Some(_interface) = vcan() else {
