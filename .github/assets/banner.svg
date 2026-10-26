@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title description">
+  <title id="title">pcan_kit — Rust CAN 通訊函式庫</title>
+  <desc id="description">深藍色背景上的 CAN 匯流排連接 PCAN-Basic 與 SocketCAN，搭配青綠色訊號與橘色節點。</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1"><stop stop-color="#101e31"/><stop offset="1" stop-color="#08121f"/></linearGradient>
+    <linearGradient id="signal"><stop stop-color="#40dcca"/><stop offset="1" stop-color="#8ee9fa"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#b7d1ef" stroke-opacity=".045"/></pattern>
+  </defs>
+  <rect width="1200" height="360" rx="22" fill="url(#background)"/>
+  <rect width="1200" height="360" rx="22" fill="url(#grid)"/>
+  <path d="M48 42H112" stroke="#40dcca" stroke-width="4" stroke-linecap="round"/>
+  <text x="48" y="88" font-family="ui-monospace,Consolas,monospace" font-size="14" fill="#83a1bd" letter-spacing="3">ONE API. TWO BACKENDS.</text>
+  <text x="43" y="176" font-family="system-ui,Segoe UI,sans-serif" font-weight="750" font-size="82" fill="#f0f7ff" letter-spacing="-4">pcan_kit</text>
+  <text x="48" y="220" font-family="system-ui,Segoe UI,sans-serif" font-size="22" fill="#b0c7dd">Rust CAN / CAN FD communication</text>
+  <g font-family="ui-monospace,Consolas,monospace" font-size="13" fill="#a9c4d9">
+    <rect x="48" y="264" width="76" height="30" rx="6" fill="#162a3b" stroke="#294459"/><text x="66" y="284">async</text>
+    <rect x="134" y="264" width="96" height="30" rx="6" fill="#162a3b" stroke="#294459"/><text x="151" y="284">Windows</text>
+    <rect x="240" y="264" width="79" height="30" rx="6" fill="#162a3b" stroke="#294459"/><text x="259" y="284">Linux</text>
+  </g>
+  <g fill="none" stroke="#284456" stroke-width="2">
+    <path d="M668 182H1136M722 182V110M902 182V110M1080 182V254"/>
+    <rect x="660" y="58" width="124" height="52" rx="10"/><rect x="835" y="58" width="134" height="52" rx="10"/><rect x="1018" y="254" width="124" height="52" rx="10"/>
+  </g>
+  <path d="M668 182H1136" stroke="url(#signal)" stroke-width="3"/>
+  <path d="M746 182h16v-15h20v30h20v-30h20v15h24" fill="none" stroke="#8ee9fa" stroke-width="2"/>
+  <g fill="#0d1b2a" stroke="#40dcca" stroke-width="3"><circle cx="722" cy="182" r="7"/><circle cx="902" cy="182" r="7"/><circle cx="1080" cy="182" r="7"/></g>
+  <g font-family="ui-monospace,Consolas,monospace" font-size="14" text-anchor="middle" fill="#d4e5f3">
+    <text x="722" y="90">PCAN-Basic</text><text x="902" y="90">SocketCAN</text><text x="1080" y="286">CAN / FD</text>
+  </g>
+  <circle cx="1080" cy="182" r="3" fill="#ffb86c"/>
+  <text x="668" y="222" font-family="ui-monospace,Consolas,monospace" font-size="12" fill="#6e91ad" letter-spacing="2">CONNECT · ROUTE · RECOVER</text>
+</svg>

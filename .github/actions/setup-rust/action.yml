@@ -1,0 +1,31 @@
+name: 安裝專案 Rust 工具鏈
+description: 共用固定工具鏈與快取設定，MSRV 可明確覆寫工具鏈。
+inputs:
+  toolchain:
+    description: 留空時使用 rust-toolchain.toml。
+    default: ""
+  cache-key:
+    description: 區隔不同用途的建置快取。
+    default: ci
+runs:
+  using: composite
+  steps:
+    - name: 安裝 Rust 與必要元件
+      shell: bash
+      env:
+        REQUESTED_TOOLCHAIN: ${{ inputs.toolchain }}
+      run: |
+        set -euo pipefail
+        if [ -n "$REQUESTED_TOOLCHAIN" ]; then
+          rustup toolchain install "$REQUESTED_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          export RUSTUP_TOOLCHAIN="$REQUESTED_TOOLCHAIN"
+          echo "RUSTUP_TOOLCHAIN=$REQUESTED_TOOLCHAIN" >> "$GITHUB_ENV"
+        else
+          rustup toolchain install
+        fi
+        rustup show active-toolchain
+    - name: 快取 Cargo 建置資料
+      uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      with:
+        key: ${{ inputs.cache-key }}-${{ inputs.toolchain }}
+        save-if: ${{ github.ref == 'refs/heads/master' && github.event_name == 'push' }}

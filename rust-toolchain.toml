@@ -1,0 +1,6 @@
+# 固定開發工具鏈；MSRV 由 Cargo.toml 宣告並由 CI 獨立驗證。
+# 下游使用本專案作為相依套件時，不受此檔案影響。
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,530 @@
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+
+use pcan_core::{
+    ActiveFeatures, BusStatus, Capabilities, Error, FilterSet, Frame, RxFrame, Stats,
+    StatsSnapshot, TransportFactory,
+};
+use tokio::sync::{Semaphore, broadcast, oneshot, watch};
+
+use crate::LinkState;
+use crate::builder::LinkBuilder;
+use crate::control::ControlBudget;
+use crate::cyclic::{
+    CyclicCommand, CyclicConfig, CyclicHandle, CyclicId, MAX_PENDING_CYCLIC_ADDS, new_shared,
+};
+use crate::events::BusEvent;
+use crate::router::{RouterCommand, SubscribeConfig, Subscription};
+use crate::supervisor::{RuntimeChannels, SupervisorCommand};
+use crate::transaction::{
+    CollectMode, PendingResponse, ResponseSpec, TransactionCommand, TransactionError,
+};
+use crate::txqueue::{PendingTxPolicy, TxItem, TxQueueDepth};
+
+fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
+    match value.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub(crate) struct LinkInner {
+    pub(crate) channels: RuntimeChannels,
+    pub(crate) state: watch::Sender<LinkState>,
+    pub(crate) events: broadcast::Sender<BusEvent>,
+    pub(crate) stats: Arc<Stats>,
+    pub(crate) bus_status: Arc<Mutex<BusStatus>>,
+    pub(crate) capabilities: Arc<Mutex<Option<(Capabilities, ActiveFeatures)>>>,
+    pub(crate) in_flight: Arc<AtomicUsize>,
+    pub(crate) tx_staged: Arc<AtomicUsize>,
+    pub(crate) tx_high_water: Arc<AtomicBool>,
+    pub(crate) raw: Arc<OnceLock<broadcast::Sender<RxFrame>>>,
+    pub(crate) pending_policy: PendingTxPolicy,
+    pub(crate) tx_capacity: usize,
+    pub(crate) tx_high_water_ratio: Option<f32>,
+    pub(crate) cyclic_next: AtomicU64,
+    pub(crate) subscriptions: ControlBudget,
+    pub(crate) transactions: ControlBudget,
+    pub(crate) cyclic: ControlBudget,
+    /// 未處理 [`CyclicCommand::Add`] 的准入名額。
+    pub(crate) cyclic_add_slots: Arc<Semaphore>,
+}
+
+impl core::fmt::Debug for LinkInner {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("LinkInner")
+            .field("state", &*self.state.borrow())
+            .field("pending_policy", &self.pending_policy)
+            .field("tx_capacity", &self.tx_capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 一條會自動維持可用性的邏輯 CAN 連線。
+///
+/// `Link` 可安全複製並跨 task 分享。傳輸故障後會以指數退避重建連線，
+/// 工廠在每次 `open()` 套用完整通道設定，監督器再重放保存的過濾器。最後
+/// 一個 `Link` 複本被丟棄時會自動關閉背景任務；仍建議顯式呼叫
+/// [`close`](Self::close) 以等待關閉完成。
+#[derive(Clone, Debug)]
+pub struct Link {
+    pub(crate) inner: Arc<LinkInner>,
+}
+
+impl Link {
+    #[allow(clippy::cast_precision_loss)]
+    fn publish_tx_high_water(&self) {
+        let Some(ratio) = self.inner.tx_high_water_ratio else {
+            return;
+        };
+        let capacity = self.inner.channels.tx.max_capacity();
+        let queued = capacity.saturating_sub(self.inner.channels.tx.capacity());
+        if queued as f32 / capacity as f32 > ratio
+            && self
+                .inner
+                .tx_high_water
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            let _receivers = self.inner.events.send(BusEvent::TxQueueHighWater {
+                queued: u32::try_from(queued).unwrap_or(u32::MAX),
+                capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+            });
+        }
+    }
+
+    /// 建立連線建構器。
+    #[must_use]
+    pub fn builder<F: TransportFactory>(factory: F) -> LinkBuilder<F> {
+        LinkBuilder::new(factory)
+    }
+
+    fn disconnected_if_fail_fast(&self) -> Result<(), Error> {
+        if self.state() == LinkState::Closed {
+            Err(Error::Closed)
+        } else if self.inner.pending_policy == PendingTxPolicy::FailFast
+            && self.state() != LinkState::Connected
+        {
+            Err(Error::Disconnected { attempt: 0 })
+        } else {
+            Ok(())
+        }
+    }
+
+    /// 將幀以 fire-and-forget 方式放入 bounded 佇列。
+    ///
+    /// 此方法不等待實際送出，佇列滿時立即回報 `TxQueueFull`。
+    ///
+    /// # Errors
+    ///
+    /// 佇列已滿、連線已關閉或 `FailFast` 政策拒絕斷線傳送時回傳錯誤。
+    pub async fn send(&self, frame: Frame) -> Result<(), Error> {
+        core::future::ready(self.try_send(frame)).await
+    }
+
+    /// 非阻塞嘗試將幀放入傳送佇列。
+    ///
+    /// # Errors
+    ///
+    /// 佇列已滿、連線已關閉或 `FailFast` 政策拒絕斷線傳送時回傳錯誤。
+    pub fn try_send(&self, frame: Frame) -> Result<(), Error> {
+        self.disconnected_if_fail_fast()?;
+        match self
+            .inner
+            .channels
+            .tx
+            .try_send(TxItem::fire_and_forget(frame))
+        {
+            Ok(()) => {
+                self.publish_tx_high_water();
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.inner.stats.inc_tx_queue_full();
+                Err(Error::TxQueueFull {
+                    capacity: self.inner.tx_capacity,
+                })
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(Error::Closed),
+        }
+    }
+
+    /// 在指定期限內等待傳送佇列取得空位。
+    ///
+    /// # Errors
+    ///
+    /// 等待逾時、連線已關閉或 `FailFast` 政策拒絕斷線傳送時回傳錯誤。
+    pub async fn send_timeout(&self, frame: Frame, timeout: Duration) -> Result<(), Error> {
+        self.disconnected_if_fail_fast()?;
+        match self
+            .inner
+            .channels
+            .tx
+            .send_timeout(TxItem::fire_and_forget(frame), timeout)
+            .await
+        {
+            Ok(()) => {
+                self.publish_tx_high_water();
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                self.inner.stats.inc_tx_queue_full();
+                Err(Error::Timeout { timeout })
+            }
+            Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => Err(Error::Closed),
+        }
+    }
+
+    /// 排入幀並等待後端確認實際送出。
+    ///
+    /// # Errors
+    ///
+    /// 排入或後端送出失敗、斷線或待送幀逾期時回傳錯誤。
+    pub async fn send_await(&self, frame: Frame) -> Result<(), Error> {
+        self.disconnected_if_fail_fast()?;
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .channels
+            .tx
+            .send(TxItem::acknowledged(frame, sender))
+            .await
+            .map_err(|_| Error::Closed)?;
+        self.publish_tx_high_water();
+        receiver.await.map_err(|_| Error::Closed)?
+    }
+
+    /// 建立推送式訂閱。
+    ///
+    /// # Errors
+    ///
+    /// 連線已關閉、訂閱容量為零或生命週期名額用盡時回傳錯誤。
+    pub async fn subscribe(&self, config: SubscribeConfig) -> Result<Subscription, Error> {
+        if self.state() == LinkState::Closed {
+            return Err(Error::Closed);
+        }
+        if config.capacity == 0 {
+            return Err(Error::Unsupported("訂閱容量必須大於零"));
+        }
+        let lease = self
+            .inner
+            .subscriptions
+            .acquire()
+            .map_err(|capacity| Error::ControlQueueFull { capacity })?;
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .channels
+            .router
+            .send(RouterCommand::Subscribe {
+                config,
+                lease,
+                control: self.inner.channels.router.clone(),
+                reply: sender,
+            })
+            .map_err(|_| Error::Closed)?;
+        receiver.await.map_err(|_| Error::Closed)?
+    }
+
+    /// 以指定過濾器訂閱，其餘採預設值。
+    ///
+    /// # Errors
+    ///
+    /// 連線已關閉時回傳錯誤。
+    pub async fn subscribe_filter(&self, filter: FilterSet) -> Result<Subscription, Error> {
+        self.subscribe(SubscribeConfig::new(filter)).await
+    }
+
+    /// 訂閱所有原始幀，供 trace 或記錄用途。
+    ///
+    /// 此廣播只在首次呼叫時建立；慢消費者會收到 `Lagged`。一般業務邏輯
+    /// 應使用過濾在推送前完成的 [`subscribe`](Self::subscribe)。
+    pub fn subscribe_all_raw(&self) -> broadcast::Receiver<RxFrame> {
+        self.inner
+            .raw
+            .get_or_init(|| broadcast::channel(256).0)
+            .subscribe()
+    }
+
+    /// 取得目前連線狀態。
+    #[must_use]
+    pub fn state(&self) -> LinkState {
+        *self.inner.state.borrow()
+    }
+
+    /// 訂閱保有最新值的狀態 watch。
+    #[must_use]
+    pub fn state_watch(&self) -> watch::Receiver<LinkState> {
+        self.inner.state.subscribe()
+    }
+
+    /// 訂閱連線事件。
+    #[must_use]
+    pub fn events(&self) -> broadcast::Receiver<BusEvent> {
+        self.inner.events.subscribe()
+    }
+
+    /// 等待連線就緒。
+    ///
+    /// 使用 `watch` 是因為它保留當前狀態；即使連線早於呼叫成功也不會漏掉。
+    ///
+    /// # Errors
+    ///
+    /// 連線永久失敗或已關閉時回傳錯誤。
+    pub async fn wait_connected(&self) -> Result<(), Error> {
+        let mut state = self.state_watch();
+        loop {
+            match *state.borrow_and_update() {
+                LinkState::Connected => return Ok(()),
+                LinkState::Closed => return Err(Error::Closed),
+                _ => {}
+            }
+            state.changed().await.map_err(|_| Error::Closed)?;
+        }
+    }
+
+    /// 取得最近一次匯流排狀態。
+    #[must_use]
+    pub fn bus_status(&self) -> BusStatus {
+        *lock(&self.inner.bus_status)
+    }
+
+    /// 取得無鎖統計快照。
+    #[must_use]
+    pub fn stats(&self) -> StatsSnapshot {
+        self.inner.stats.snapshot()
+    }
+
+    /// 取得傳送佇列的即時水位快照。
+    ///
+    /// `channel` 是尚未被傳送工作者取走的第一段，直接決定
+    /// [`try_send`](Self::try_send) 是否會回傳 `TxQueueFull`；`staged` 是工作者
+    /// 已取走、但尚未送上匯流排的第二段。整體延遲應查看兩段合計，主動背壓
+    /// 則應查看 channel 段的使用比例。
+    #[must_use]
+    pub fn tx_queue_depth(&self) -> TxQueueDepth {
+        let capacity = self.inner.channels.tx.max_capacity();
+        TxQueueDepth {
+            channel: capacity.saturating_sub(self.inner.channels.tx.capacity()),
+            staged: self.inner.tx_staged.load(Ordering::Relaxed),
+            capacity,
+        }
+    }
+
+    /// 取得當前後端**具備**的能力；未連線時為 `None`。
+    ///
+    /// 回報的是「做不做得到」。要知道這次連線實際啟用了什麼，請用
+    /// [`active_features`](Self::active_features)。
+    #[must_use]
+    pub fn capabilities(&self) -> Option<Capabilities> {
+        lock(&self.inner.capabilities).map(|(capabilities, _)| capabilities)
+    }
+
+    /// 取得當前連線**實際啟用**的功能；未連線時為 `None`。
+    ///
+    /// 與 [`capabilities`](Self::capabilities) 的差別見
+    /// [`ActiveFeatures`]。重連會以新開啟的傳輸層重新填入。
+    #[must_use]
+    pub fn active_features(&self) -> Option<ActiveFeatures> {
+        lock(&self.inner.capabilities).map(|(_, active)| active)
+    }
+
+    /// 更新硬體或核心層過濾器，並保存供後續重連完整重放。
+    ///
+    /// 未連線時只更新保存值；已連線時會等待目前傳輸層確認套用。
+    ///
+    /// # Errors
+    ///
+    /// 監督任務已關閉，或目前傳輸層拒絕過濾器時回傳錯誤。
+    pub async fn set_hardware_filter(&self, filter: FilterSet) -> Result<(), Error> {
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .channels
+            .supervisor
+            .send(SupervisorCommand::SetHardwareFilter {
+                filter,
+                reply: sender,
+            })
+            .await
+            .map_err(|_| Error::Closed)?;
+        receiver.await.map_err(|_| Error::Closed)?
+    }
+
+    /// 註冊週期傳送項目。
+    ///
+    /// 已建立的項目之後都以合併控制命令操作，唯獨建立本身無法合併——每一筆
+    /// 都帶著各自的設定與共享槽。因此新增採固定名額准入：未被排程器取走的
+    /// 新增命令達到上限時立即回 [`Error::ControlQueueFull`]，名額會在排程器
+    /// 取走命令時歸還，呼叫端稍後重試即可。
+    /// 此外，所有週期項目另共用 [`LinkBuilder::control_capacity`] 的生命週期
+    /// 名額；控制代碼、背景項目與殘留命令都釋放後才歸還此名額。
+    ///
+    /// # Errors
+    ///
+    /// 週期為零、生命週期或新增命令名額用盡、連線或排程器已關閉時回傳錯誤。
+    pub fn schedule_cyclic(&self, config: CyclicConfig) -> Result<CyclicHandle, Error> {
+        if config.period.is_zero() {
+            return Err(Error::Unsupported("週期必須大於零"));
+        }
+        if self.state() == LinkState::Closed || self.inner.channels.cyclic.is_closed() {
+            return Err(Error::Closed);
+        }
+        let lease = self
+            .inner
+            .cyclic
+            .acquire()
+            .map_err(|capacity| Error::ControlQueueFull { capacity })?;
+        let admission = Arc::clone(&self.inner.cyclic_add_slots)
+            .try_acquire_owned()
+            .map_err(|_| Error::ControlQueueFull {
+                capacity: MAX_PENDING_CYCLIC_ADDS,
+            })?;
+        let id = CyclicId(self.inner.cyclic_next.fetch_add(1, Ordering::Relaxed));
+        let (pending, stats) = new_shared(&config);
+        self.inner
+            .channels
+            .cyclic
+            .send(CyclicCommand::Add {
+                id,
+                config,
+                pending: Arc::clone(&pending),
+                stats: Arc::clone(&stats),
+                _admission: admission,
+                lease: Arc::clone(&lease),
+            })
+            .map_err(|_| Error::Closed)?;
+        Ok(CyclicHandle::create(
+            id,
+            pending,
+            stats,
+            self.inner.channels.cyclic.clone(),
+            lease,
+        ))
+    }
+
+    /// 先向 RX 路由註冊並等待 ack，再回傳等待器。
+    ///
+    /// 這個順序保證快速 ECU 回應不會在等待器完成註冊前抵達。等待器被
+    /// `tokio::select!` 取消或直接丟棄時，其 `Drop` guard 會自動註銷。
+    ///
+    /// # Errors
+    ///
+    /// 連線已關閉、同時進行的交易達上限或生命週期名額用盡時回傳交易錯誤。
+    pub async fn prepare(&self, spec: &ResponseSpec) -> Result<PendingResponse, TransactionError> {
+        if self.state() == LinkState::Closed {
+            return Err(TransactionError::Closed);
+        }
+        let lease = self
+            .inner
+            .transactions
+            .acquire()
+            .map_err(|capacity| TransactionError::ControlQueueFull { capacity })?;
+        let capacity = match spec.mode {
+            CollectMode::First => 1,
+            CollectMode::Exactly(count) => count.get(),
+            CollectMode::Window(_) => spec.max_responses.get().min(64),
+        };
+        let (sender, receiver) = oneshot::channel();
+        self.inner
+            .channels
+            .transaction
+            .send(TransactionCommand::Register {
+                lease,
+                matcher: spec.matcher.clone(),
+                capacity,
+                spec: spec.clone(),
+                control: self.inner.channels.transaction.clone(),
+                reply: sender,
+            })
+            .map_err(|_| TransactionError::Closed)?;
+        receiver.await.map_err(|_| TransactionError::Closed)?
+    }
+
+    async fn request_inner(
+        &self,
+        request: Frame,
+        spec: &ResponseSpec,
+    ) -> Result<Vec<RxFrame>, TransactionError> {
+        let mut pending = self.prepare(spec).await?;
+        let mut retry = 0_u8;
+        loop {
+            self.send_await(request)
+                .await
+                .map_err(|error| TransactionError::Send(Box::new(error)))?;
+            match pending.wait_attempt().await {
+                Ok(frames) => return Ok(frames),
+                Err(TransactionError::Timeout { .. }) if retry < spec.retries => {
+                    retry = retry.saturating_add(1);
+                    pending.clear_buffer();
+                    let _receivers = self
+                        .inner
+                        .events
+                        .send(BusEvent::TransactionRetried { attempt: retry });
+                }
+                Err(TransactionError::Timeout { .. }) => {
+                    return Err(TransactionError::Timeout {
+                        timeout: spec.timeout,
+                        retries: retry,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// 送出請求並等待第一個符合條件的回應。
+    ///
+    /// # Errors
+    ///
+    /// 註冊、傳送、等待或回應比對失敗時回傳交易錯誤。
+    pub async fn request(
+        &self,
+        request: Frame,
+        spec: &ResponseSpec,
+    ) -> Result<RxFrame, TransactionError> {
+        self.request_inner(request, spec)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(TransactionError::Disconnected)
+    }
+
+    /// 送出請求並依規格收集多個回應。
+    ///
+    /// # Errors
+    ///
+    /// 註冊、傳送、等待或回應比對失敗時回傳交易錯誤；時間窗收集超過
+    /// [`ResponseSpec::max_responses`] 時回傳 [`TransactionError::ResponseLimitExceeded`]。
+    pub async fn request_many(
+        &self,
+        request: Frame,
+        spec: &ResponseSpec,
+    ) -> Result<Vec<RxFrame>, TransactionError> {
+        self.request_inner(request, spec).await
+    }
+
+    /// 取得目前已註冊的交易數，主要供壓力與取消清理測試。
+    #[doc(hidden)]
+    #[must_use]
+    pub fn in_flight_count(&self) -> usize {
+        self.inner.in_flight.load(Ordering::Acquire)
+    }
+
+    /// 主動關閉連線與所有背景排程；重複呼叫安全。
+    pub async fn close(&self) {
+        if self.state() == LinkState::Closed {
+            return;
+        }
+        let (sender, receiver) = oneshot::channel();
+        if self
+            .inner
+            .channels
+            .supervisor
+            .send(SupervisorCommand::Close(sender))
+            .await
+            .is_ok()
+        {
+            let _ignored = receiver.await;
+        }
+    }
+}

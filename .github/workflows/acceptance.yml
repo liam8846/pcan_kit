@@ -1,0 +1,89 @@
+name: 平台與硬體驗收
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: acceptance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  scope:
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    name: 判斷驗收範圍
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      required: ${{ steps.scope.outputs.required }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 驗證範圍規則
+        run: python3 -m unittest discover -s .github/scripts -p 'test_acceptance_policy.py'
+      - name: 列出完整變更並判斷範圍
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" > "$RUNNER_TEMP/pr-files.json"
+          python3 .github/scripts/acceptance_policy.py "$RUNNER_TEMP/pr-files.json"
+      - name: 確認驗收環境已設定人工審核
+        if: steps.scope.outputs.required == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/environments/hardware-acceptance" > "$RUNNER_TEMP/hardware-environment.json"
+          python3 .github/scripts/check_environment.py "$RUNNER_TEMP/hardware-environment.json"
+
+  hardware:
+    name: 等待 Windows 與 PEAK 實機驗收
+    needs: scope
+    if: needs.scope.outputs.required == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment:
+      name: hardware-acceptance
+      url: ${{ github.event.pull_request.html_url }}
+    steps:
+      # 此工作只記錄人工核准，不執行 PR 程式碼，也不宣稱自動測過硬體。
+      - name: 確認核准仍對應本次 PR 版本
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          current=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq .head.sha)
+          test "$current" = "$HEAD_SHA"
+          echo "已由 hardware-acceptance 環境審核者核准版本 $HEAD_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  acceptance-ok:
+    name: 平台與硬體驗收通過
+    if: always()
+    needs: [scope, hardware]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: 驗收門檻
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          REQUIRED: ${{ needs.scope.outputs.required }}
+          HARDWARE_RESULT: ${{ needs.hardware.result }}
+        run: |
+          test "$SCOPE_RESULT" = success
+          if [ "$REQUIRED" = true ]; then
+            test "$HARDWARE_RESULT" = success
+          else
+            test "$REQUIRED" = false
+            test "$HARDWARE_RESULT" = skipped
+          fi

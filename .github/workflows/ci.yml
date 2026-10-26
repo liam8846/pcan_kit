@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: 格式、文件與流程規則
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: quality
+      - run: cargo fmt --all -- --check
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: actionlint@1.7.12
+      - name: 檢查工作流程語法與安全用法
+        run: actionlint -color
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - run: python3 .github/scripts/check_cjk_docs.py
+      - name: 建置 API 文件
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  platform:
+    name: 建置與測試（${{ matrix.os }}）
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - name: 靜態分析
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - name: 全功能測試
+        run: cargo test --workspace --all-features --locked
+      - name: 建置五個範例
+        run: cargo build -p pcan-kit --examples --locked
+      - name: 停用預設功能
+        run: cargo clippy --workspace --no-default-features --locked -- -D warnings
+
+  msrv:
+    name: 最低支援 Rust 版本
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: 讀取 MSRV
+        id: version
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path('Cargo.toml').read_text())['workspace']['package']['rust-version']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\n')
+          PY
+      - uses: ./.github/actions/setup-rust
+        with:
+          toolchain: ${{ steps.version.outputs.version }}
+          cache-key: msrv
+      - run: cargo check --workspace --all-features --locked
+
+  features:
+    name: 功能組合冪集
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: features
+      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-hack@0.6.45
+      - run: cargo hack --workspace --feature-powerset --exclude-features vcan-tests --keep-going check --locked
+
+  vcan:
+    name: 虛擬 CAN 整合測試
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: vcan
+      - name: 建立獨立測試介面
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! sudo modprobe vcan; then
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe vcan
+          fi
+          for name in vcan0 vcan9; do
+            sudo ip link add dev "$name" type vcan
+            sudo ip link set "$name" mtu 72
+            sudo ip link set up "$name"
+          done
+      - name: SocketCAN 傳輸層
+        env:
+          PCAN_VCAN: vcan0
+          PCAN_VCAN_REQUIRED: "1"
+        run: cargo test -p pcan-socketcan --features vcan-tests --test vcan --locked -- --test-threads=1 --nocapture
+      - name: Link 端到端
+        env:
+          PCAN_VCAN: vcan0
+          PCAN_VCAN_ADMIN: vcan9
+          PCAN_VCAN_REQUIRED: "1"
+        run: cargo test -p pcan-kit --features vcan-tests --test vcan_link --locked -- --test-threads=1 --nocapture
+      - name: 介面中斷與恢復
+        env:
+          PCAN_VCAN_ADMIN: vcan9
+          PCAN_VCAN_REQUIRED: "1"
+        run: cargo test -p pcan-socketcan --features vcan-tests --test vcan_admin --locked -- --test-threads=1 --nocapture
+      - name: 清理測試介面
+        if: always()
+        shell: bash
+        run: |
+          sudo ip link del vcan0 2>/dev/null || true
+          sudo ip link del vcan9 2>/dev/null || true
+
+  supply-chain:
+    name: 供應鏈稽核
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          arguments: --all-features
+
+  ci-ok:
+    name: CI 全數通過
+    if: always()
+    needs: [quality, platform, msrv, features, vcan, supply-chain]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: 所有檢查必須成功，跳過或取消也不得通過
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          jobs = json.loads(os.environ['RESULTS'])
+          failed = [name for name, job in jobs.items() if job['result'] != 'success']
+          if failed:
+              raise SystemExit('未完成的必要檢查：' + ', '.join(failed))
+          print('所有必要檢查成功')
+          PY
