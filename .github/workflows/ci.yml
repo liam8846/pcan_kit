@@ -27,9 +27,15 @@ jobs:
         with:
           cache-key: quality
       - run: cargo fmt --all -- --check
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
-        with:
-          tool: actionlint@1.7.12
+      - name: 安裝固定版本 actionlint 並校驗
+        run: |
+          curl --fail --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/actionlint-bin"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint-bin" actionlint
+          echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
       - name: 檢查工作流程語法與安全用法
         run: actionlint -color
       - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
