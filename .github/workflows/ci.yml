@@ -102,7 +102,7 @@ jobs:
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: features
-      - uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-hack@0.6.45
       - run: cargo hack --workspace --feature-powerset --exclude-features vcan-tests --keep-going check --locked
